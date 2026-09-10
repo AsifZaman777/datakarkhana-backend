@@ -22,7 +22,10 @@ BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
 SMTP_USER = os.getenv("SMTP_USER", "asifdev777@gmail.com")
 
 # ── Superadmin & Frontend URL Configuration ───────────────
-FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
+FRONTEND_MODE = os.getenv("FRONTEND_MODE", "local").strip().lower()  # "local" or "render"
+FRONTEND_LOCAL_URL = os.getenv("FRONTEND_LOCAL_URL", "http://localhost:3000").rstrip("/")
+FRONTEND_RENDER_URL = os.getenv("FRONTEND_RENDER_URL", "").rstrip("/")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/") or (FRONTEND_RENDER_URL if FRONTEND_MODE in ("render", "production", "prod") else FRONTEND_LOCAL_URL)
 SUPERADMIN_EMAIL = os.getenv("SUPERADMIN_EMAIL", "asifdev777@gmail.com")
 SUPERADMIN_PASSWORD = os.getenv("SUPERADMIN_PASSWORD", "admin123")
 SUPERADMIN_NAME = os.getenv("SUPERADMIN_NAME", "Asif Zaman (Superadmin)")

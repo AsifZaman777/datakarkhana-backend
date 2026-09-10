@@ -28,7 +28,7 @@ from scraper import (
     add_job_log, get_job_recent_logs
 )
 from senders import run_whatsapp_campaign, write_log_to_file, SCREENSHOTS_FOLDER as CAMPAIGN_SCREENSHOTS
-from config import REGIONS, CATEGORIES, BREVO_API_KEY as CONFIG_BREVO_API_KEY, SMTP_USER as CONFIG_SMTP_USER, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, SUPERADMIN_NAME, FRONTEND_URL, BKASH_NUMBER, BKASH_ACCOUNT_TYPE, PATHAO_NUMBER, PATHAO_ACCOUNT_TYPE, CREDIT_PACKAGES
+from config import REGIONS, CATEGORIES, BREVO_API_KEY as CONFIG_BREVO_API_KEY, SMTP_USER as CONFIG_SMTP_USER, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, SUPERADMIN_NAME, FRONTEND_URL, FRONTEND_LOCAL_URL, FRONTEND_RENDER_URL, FRONTEND_MODE, BKASH_NUMBER, BKASH_ACCOUNT_TYPE, PATHAO_NUMBER, PATHAO_ACCOUNT_TYPE, CREDIT_PACKAGES
 from email_templates import get_verification_email_html
 
 app = FastAPI(title="MarketingOstad API Service")
@@ -56,8 +56,9 @@ _cors_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
-if FRONTEND_URL and FRONTEND_URL not in _cors_origins:
-    _cors_origins.append(FRONTEND_URL)
+for _fe in [FRONTEND_URL, FRONTEND_LOCAL_URL, FRONTEND_RENDER_URL]:
+    if _fe and _fe not in _cors_origins:
+        _cors_origins.append(_fe)
 
 app.add_middleware(
     CORSMiddleware,
@@ -341,7 +342,44 @@ def send_free_verification_email(recipient_email: str, full_name: str, verify_li
 
     return False, last_error
 
-# ── Auth Endpoints ───────────────────────────────────────
+def resolve_frontend_base_url(request: Optional[Request] = None) -> str:
+    """Dynamically determine the frontend URL based on FRONTEND_MODE flag ('local' or 'render') or request origin"""
+    mode = (os.getenv("FRONTEND_MODE") or FRONTEND_MODE or "local").strip().lower()
+
+    # 1. If FRONTEND_MODE flag is set to render
+    if mode in ("render", "production", "prod"):
+        if FRONTEND_RENDER_URL:
+            return FRONTEND_RENDER_URL.rstrip("/")
+
+    # 2. If FRONTEND_MODE flag is set to local
+    if mode in ("local", "dev", "development"):
+        if FRONTEND_LOCAL_URL:
+            return FRONTEND_LOCAL_URL.rstrip("/")
+
+    # 3. Direct detection from the active client's request (e.g. Origin or Referer header)
+    if request:
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(origin)
+                if parsed.scheme in ("http", "https") and parsed.netloc:
+                    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+            except Exception:
+                pass
+
+    # 4. Check if running on cloud Render
+    if os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"):
+        if FRONTEND_RENDER_URL:
+            return FRONTEND_RENDER_URL.rstrip("/")
+
+    # 5. Explicit FRONTEND_URL or local fallback
+    if FRONTEND_URL:
+        return FRONTEND_URL.rstrip("/")
+    if FRONTEND_LOCAL_URL:
+        return FRONTEND_LOCAL_URL.rstrip("/")
+
+    return "http://localhost:3000"
 
 @app.post("/api/auth/register")
 def register(req: RegisterRequest, request: Request):
@@ -354,9 +392,7 @@ def register(req: RegisterRequest, request: Request):
     pwd_hash = hash_password(req.password)
     v_token = str(uuid.uuid4())
     
-    base_url = FRONTEND_URL
-    if not base_url and request and request.headers.get("origin"):
-        base_url = request.headers.get("origin").rstrip("/")
+    base_url = resolve_frontend_base_url(request)
     verify_link = f"{base_url}/auth?verify_token={v_token}"
     
     # 1. SEND EMAIL FIRST - DO NOT INSERT TO DATABASE IF EMAIL DISPATCH FAILS!
@@ -437,9 +473,7 @@ def resend_verification(req: ResendVerificationRequest, request: Request):
     conn.commit()
     conn.close()
     
-    base_url = FRONTEND_URL
-    if not base_url and request and request.headers.get("origin"):
-        base_url = request.headers.get("origin").rstrip("/")
+    base_url = resolve_frontend_base_url(request)
     verify_link = f"{base_url}/auth?verify_token={v_token}"
     email_dispatched, err_msg = send_free_verification_email(req.email, user["full_name"], verify_link)
     if not email_dispatched:
