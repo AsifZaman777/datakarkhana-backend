@@ -1,7 +1,7 @@
 import os
 import hashlib
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 SECRET_KEY = os.getenv("JWT_SECRET", "marketingostad_super_secret_cyber_key_999")
 ALGORITHM = "HS256"
@@ -22,7 +22,7 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 def create_jwt_token(user_id: int, role: str) -> str:
-    expire = datetime.utcnow() + timedelta(days=7)
+    expire = datetime.now(timezone.utc) + timedelta(days=7)
     payload = {
         "exp": expire,
         "sub": str(user_id),

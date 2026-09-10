@@ -10,6 +10,7 @@ import queue
 import asyncio
 
 import pandas as pd
+import requests
 from datetime import datetime, timedelta
 from typing import Optional, Union
 from fastapi import FastAPI, Depends, HTTPException, status, Header, BackgroundTasks, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
@@ -48,10 +49,20 @@ async def db_connection_lifecycle_middleware(request: Request, call_next):
                     pass
         _request_db_conns.reset(token)
 
-# Allow CORS for React frontend (standard dev port 5173 / 3000 / localhost)
+# Allow CORS for React frontend (standard dev port 5173 / 3000 / localhost & production FRONTEND_URL)
+_cors_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+if FRONTEND_URL and FRONTEND_URL not in _cors_origins:
+    _cors_origins.append(FRONTEND_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins if FRONTEND_URL else ["*"],
+    allow_origin_regex=r"https?://.*" if FRONTEND_URL else None,
     allow_credentials=True,
     allow_headers=["*"],
     allow_methods=["*"],
@@ -1193,6 +1204,7 @@ def send_custom_notification(recipient_email: str, recipient_phone: str, subject
 
     return sent_email or sent_wa
 
+@app.post("/api/scraper/requests")
 @app.post("/api/requests/submit")
 def submit_dataset_request(req: DatasetRequestCreate, current_user: dict = Depends(get_current_user)):
     if not req.category_query or not req.category_query.strip():
@@ -1541,6 +1553,7 @@ def get_payment_gateway_settings():
         "custom_package": pkg_cfg.get("custom_package", {})
     }
 
+@app.get("/api/config/payment-gateways")
 @app.get("/api/payments/packages-config")
 def get_payment_packages_config():
     return get_payment_gateway_settings()
@@ -1633,6 +1646,7 @@ class PaymentRequestPayload(BaseModel):
     bkash_number: str
     transaction_id: str
 
+@app.post("/api/payments/submit")
 @app.post("/api/payments/submit-request")
 def submit_payment_request(req: PaymentRequestPayload, current_user: dict = Depends(get_current_user)):
     if not req.transaction_id or not req.bkash_number:
@@ -1663,6 +1677,7 @@ def list_my_payment_requests(current_user: dict = Depends(get_current_user)):
     conn.close()
     return [dict(r) for r in rows]
 
+@app.get("/api/admin/payments")
 @app.get("/api/admin/payment-requests")
 def list_admin_payment_requests(admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
@@ -2998,3 +3013,7 @@ def get_campaign_screenshot(campaign_id: str, current_user: dict = Depends(get_c
     except Exception:
         return {"available": False, "image": None}
 
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

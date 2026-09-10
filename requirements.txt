@@ -8,3 +8,7 @@ pandas
 openpyxl
 jinja2
 psycopg2-binary
+Pillow
+requests
+websockets
+
