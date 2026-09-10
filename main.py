@@ -1082,6 +1082,8 @@ def run_background_scrape(job_id, queries, division, district, area, headless=Fa
                 driver.quit()
             except Exception:
                 pass
+            import gc
+            gc.collect()
         clear_scraper_frame(job_id)
 
     # Save any results collected so far (even if stopped or interrupted!)
