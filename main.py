@@ -11,7 +11,7 @@ import asyncio
 
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 from fastapi import FastAPI, Depends, HTTPException, status, Header, BackgroundTasks, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, FileResponse
@@ -79,8 +79,55 @@ os.makedirs(LOGS_FOLDER, exist_ok=True)
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_FOLDER), name="uploads")
 
+SERVER_START_TIME = time.time()
+
+@app.get("/health")
+@app.get("/api/health")
+def health_check():
+    """Lightweight health check endpoint for uptime monitors and Render keep-alive pings"""
+    db_status = "ok"
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1;").fetchone()
+        conn.close()
+    except Exception as e:
+        db_status = f"unhealthy: {str(e)}"
+
+    uptime_sec = int(time.time() - SERVER_START_TIME)
+    uptime_str = f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s"
+    return {
+        "status": "healthy" if "unhealthy" not in db_status else "degraded",
+        "service": "MarketingOstad Backend",
+        "database": db_status,
+        "uptime": uptime_str,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+def _keep_alive_loop():
+    """Pings the public Render URL every 12 minutes to keep the free-tier service awake"""
+    time.sleep(30)
+    target = (
+        os.getenv("SELF_PING_URL")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or "https://datakarkhana-backend.onrender.com"
+    ).rstrip("/")
+    ping_url = f"{target}/api/health"
+    print(f"[KEEP-ALIVE] Auto-ping background task started for: {ping_url}")
+    while True:
+        try:
+            # Sleep 12 minutes (720s) - Render free tier sleeps after 15 min of inactivity
+            time.sleep(720)
+            res = requests.get(ping_url, timeout=15)
+            print(f"[KEEP-ALIVE] Ping {res.status_code} to {ping_url} at {datetime.now().strftime('%H:%M:%S')}")
+        except Exception as err:
+            print(f"[KEEP-ALIVE] Ping notice: {err}")
+
 @app.on_event("startup")
 def startup_event():
+    # Launch background keep-alive pinger thread
+    t = threading.Thread(target=_keep_alive_loop, daemon=True)
+    t.start()
+
     try:
         from database import get_clean_database_url
         if not get_clean_database_url():
