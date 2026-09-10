@@ -246,7 +246,7 @@ def get_pool():
                 "Please configure your Supabase PostgreSQL connection string, e.g.:\n"
                 "DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres"
             )
-        _db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=5, maxconn=40, dsn=url)
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=5, maxconn=80, dsn=url)
     return _db_pool
 
 def get_db():
@@ -266,7 +266,16 @@ def get_db():
             gc.collect()
             time.sleep(0.02)
             if attempt == max_retries - 1:
-                raise
+                # Fallback: create standalone direct connection instead of raising PoolError
+                try:
+                    raw_conn = psycopg2.connect(get_clean_database_url())
+                    wrapper = PostgresConnectionWrapper(raw_conn, None)
+                    active_conns = _request_db_conns.get()
+                    if active_conns is not None:
+                        active_conns.append(wrapper)
+                    return wrapper
+                except Exception:
+                    raise
         except Exception:
             if raw_conn is not None:
                 try:
@@ -279,7 +288,15 @@ def get_db():
             time.sleep(0.02)
 
     if raw_conn is None:
-        raw_conn = pool.getconn()
+        try:
+            raw_conn = pool.getconn()
+        except psycopg2.pool.PoolError:
+            raw_conn = psycopg2.connect(get_clean_database_url())
+            wrapper = PostgresConnectionWrapper(raw_conn, None)
+            active_conns = _request_db_conns.get()
+            if active_conns is not None:
+                active_conns.append(wrapper)
+            return wrapper
 
     wrapper = PostgresConnectionWrapper(raw_conn, pool)
 
