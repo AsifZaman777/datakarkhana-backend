@@ -14,6 +14,9 @@ if os.path.exists(_env_file):
                 key, val = line.split("=", 1)
                 os.environ[key.strip()] = val.strip().strip("'").strip('"')
 
+# ── Supabase PostgreSQL Database Configuration ────────────
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL") or os.getenv("POSTGRES_URL") or ""
+
 # ── Brevo & Email Configuration ───────────────────────────
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
 SMTP_USER = os.getenv("SMTP_USER", "asifdev777@gmail.com")

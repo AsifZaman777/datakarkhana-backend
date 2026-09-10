@@ -495,7 +495,7 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
                 log_status(f"⚠️ Skipped {name} ({formatted}): Number is not on WhatsApp. Closed 'OK' modal automatically.")
                 update_failed()
                 conn = get_db()
-                conn.execute("INSERT OR REPLACE INTO whatsapp_progress (recipient_group, last_index, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)", (recipient_group, current_index + 1))
+                conn.execute("INSERT INTO whatsapp_progress (recipient_group, last_index, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT (recipient_group) DO UPDATE SET last_index = EXCLUDED.last_index, updated_at = CURRENT_TIMESTAMP", (recipient_group, current_index + 1))
                 conn.execute("UPDATE marketing_campaigns SET sent_count = ? WHERE id = ?", (current_index + 1, campaign_id))
                 conn.commit()
                 conn.close()
@@ -511,7 +511,7 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
                     log_status(f"⚠️ Could not load chat element for {name} ({formatted}). Closed any prompt & skipping...")
                 update_failed()
                 conn = get_db()
-                conn.execute("INSERT OR REPLACE INTO whatsapp_progress (recipient_group, last_index, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)", (recipient_group, current_index + 1))
+                conn.execute("INSERT INTO whatsapp_progress (recipient_group, last_index, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT (recipient_group) DO UPDATE SET last_index = EXCLUDED.last_index, updated_at = CURRENT_TIMESTAMP", (recipient_group, current_index + 1))
                 conn.execute("UPDATE marketing_campaigns SET sent_count = ? WHERE id = ?", (current_index + 1, campaign_id))
                 conn.commit()
                 conn.close()
@@ -548,9 +548,9 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
                 # Save screenshot after sending
                 save_campaign_screenshot(driver, campaign_id)
 
-                # Update SQLite database progress
+                # Update PostgreSQL database progress
                 conn = get_db()
-                conn.execute("INSERT OR REPLACE INTO whatsapp_progress (recipient_group, last_index, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)", (recipient_group, current_index + 1))
+                conn.execute("INSERT INTO whatsapp_progress (recipient_group, last_index, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT (recipient_group) DO UPDATE SET last_index = EXCLUDED.last_index, updated_at = CURRENT_TIMESTAMP", (recipient_group, current_index + 1))
                 conn.execute("UPDATE marketing_campaigns SET sent_count = ? WHERE id = ?", (current_index + 1, campaign_id))
                 conn.commit()
                 conn.close()

@@ -1,7 +1,6 @@
 import unittest
 import os
 import json
-import sqlite3
 from fastapi.testclient import TestClient
 
 # Import FastAPI app from main.py

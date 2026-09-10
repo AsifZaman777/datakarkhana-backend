@@ -46,16 +46,25 @@ os.makedirs(LOGS_FOLDER, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_FOLDER), name="uploads")
 
 @app.on_event("startup")
-def startup_db_unban_admins():
+def startup_event():
     try:
+        from database import get_clean_database_url
+        if not get_clean_database_url():
+            print("\n" + "="*70)
+            print("[SUPABASE NOTICE] DATABASE_URL is not set yet in backend/.env.")
+            print("Please configure your Supabase PostgreSQL connection string in backend/.env:")
+            print("DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres")
+            print("="*70 + "\n")
+            return
+        init_db()
         conn = get_db()
         conn.execute("UPDATE users SET is_banned = 0, is_verified = 1, warning_message = '' WHERE role IN ('admin', 'superadmin') OR email = 'admin@marketingostad.com' OR email = 'admin@databazaar.com'")
         conn.execute("DELETE FROM banned_ips")
         conn.commit()
         conn.close()
-        print("[OK] Admin accounts and localhost unbanned automatically on backend startup.")
+        print("[OK] Supabase PostgreSQL connected. Admin accounts unbanned automatically on startup.")
     except Exception as e:
-        print("[STARTUP DB UNBAN ERROR]", e)
+        print("[STARTUP DB ERROR]", e)
 
 # ── Dependencies ─────────────────────────────────────────
 
@@ -1406,7 +1415,7 @@ def request_promote_job(
 def list_promotion_requests(admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
     rows = conn.execute("""
-        SELECT sj.*, u.email, u.full_name FROM scrape_jobs sj
+        SELECT sj.*, u.email AS user_email, u.full_name FROM scrape_jobs sj
         JOIN users u ON sj.user_id = u.id
         WHERE sj.promotion_status = 'pending'
         ORDER BY sj.created_at DESC
@@ -1491,13 +1500,13 @@ async def update_admin_payment_settings(
     conn = get_db()
 
     if bkash_number is not None:
-        conn.execute("INSERT OR REPLACE INTO payment_settings (setting_key, setting_value) VALUES ('bkash_number', ?)", (bkash_number.strip(),))
+        conn.execute("INSERT INTO payment_settings (setting_key, setting_value) VALUES ('bkash_number', ?) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", (bkash_number.strip(),))
     if bkash_account_type is not None:
-        conn.execute("INSERT OR REPLACE INTO payment_settings (setting_key, setting_value) VALUES ('bkash_account_type', ?)", (bkash_account_type.strip(),))
+        conn.execute("INSERT INTO payment_settings (setting_key, setting_value) VALUES ('bkash_account_type', ?) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", (bkash_account_type.strip(),))
     if pathao_number is not None:
-        conn.execute("INSERT OR REPLACE INTO payment_settings (setting_key, setting_value) VALUES ('pathao_number', ?)", (pathao_number.strip(),))
+        conn.execute("INSERT INTO payment_settings (setting_key, setting_value) VALUES ('pathao_number', ?) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", (pathao_number.strip(),))
     if pathao_account_type is not None:
-        conn.execute("INSERT OR REPLACE INTO payment_settings (setting_key, setting_value) VALUES ('pathao_account_type', ?)", (pathao_account_type.strip(),))
+        conn.execute("INSERT INTO payment_settings (setting_key, setting_value) VALUES ('pathao_account_type', ?) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", (pathao_account_type.strip(),))
 
     if bkash_qr_file and bkash_qr_file.filename:
         ext = os.path.splitext(bkash_qr_file.filename)[1] or ".png"
@@ -1506,7 +1515,7 @@ async def update_admin_payment_settings(
         with open(filepath, "wb") as f:
             f.write(await bkash_qr_file.read())
         rel_url = f"/uploads/{filename}"
-        conn.execute("INSERT OR REPLACE INTO payment_settings (setting_key, setting_value) VALUES ('bkash_qr_url', ?)", (rel_url,))
+        conn.execute("INSERT INTO payment_settings (setting_key, setting_value) VALUES ('bkash_qr_url', ?) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", (rel_url,))
 
     if pathao_qr_file and pathao_qr_file.filename:
         ext = os.path.splitext(pathao_qr_file.filename)[1] or ".png"
@@ -1515,7 +1524,7 @@ async def update_admin_payment_settings(
         with open(filepath, "wb") as f:
             f.write(await pathao_qr_file.read())
         rel_url = f"/uploads/{filename}"
-        conn.execute("INSERT OR REPLACE INTO payment_settings (setting_key, setting_value) VALUES ('pathao_qr_url', ?)", (rel_url,))
+        conn.execute("INSERT INTO payment_settings (setting_key, setting_value) VALUES ('pathao_qr_url', ?) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", (rel_url,))
 
     conn.commit()
     conn.close()
@@ -1597,7 +1606,7 @@ def list_my_payment_requests(current_user: dict = Depends(get_current_user)):
 def list_admin_payment_requests(admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
     rows = conn.execute("""
-        SELECT pr.*, u.email, u.full_name FROM payment_requests pr
+        SELECT pr.*, u.email AS user_email, u.full_name FROM payment_requests pr
         JOIN users u ON pr.user_id = u.id
         ORDER BY CASE WHEN pr.status = 'pending' THEN 0 ELSE 1 END, pr.created_at DESC
     """).fetchall()
@@ -2196,7 +2205,7 @@ def list_brevo_applications(current_user: dict = Depends(get_admin_user)):
     rows = conn.execute("""
         SELECT a.*, u.email as user_email, u.full_name as user_name, u.brevo_api_key, u.daily_email_limit
         FROM brevo_applications a
-        JOIN users u ON a.user_id = u.id
+        LEFT JOIN users u ON a.user_id = u.id
         ORDER BY a.created_at DESC
     """).fetchall()
     conn.close()
@@ -2452,7 +2461,7 @@ def ban_user(target_user_id: int, req: BanRequest, admin_user: dict = Depends(ge
     conn.execute("UPDATE users SET is_banned = ?, warning_message = ? WHERE id = ?", (req.is_banned, req.warning_message, target_user_id))
     if req.ban_ip and req.ip_address and req.ip_address not in ("127.0.0.1", "::1", "localhost"):
         if req.is_banned == 1:
-            conn.execute("INSERT OR IGNORE INTO banned_ips (ip_address, reason) VALUES (?, ?)", (req.ip_address, req.warning_message))
+            conn.execute("INSERT INTO banned_ips (ip_address, reason) VALUES (?, ?) ON CONFLICT (ip_address) DO NOTHING", (req.ip_address, req.warning_message))
         else:
             conn.execute("DELETE FROM banned_ips WHERE ip_address = ?", (req.ip_address,))
     conn.commit()
@@ -2879,76 +2888,3 @@ def get_campaign_screenshot(campaign_id: str, current_user: dict = Depends(get_c
     except Exception:
         return {"available": False, "image": None}
 
-# ── Database Auto Initialize ──────────────────────────────
-
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    conn = get_db()
-    pwd_hash = hash_password(SUPERADMIN_PASSWORD)
-    
-    # Register / ensure sole Superadmin from env config
-    try:
-        superadmin = conn.execute("SELECT id FROM users WHERE email = ?", (SUPERADMIN_EMAIL,)).fetchone()
-        if not superadmin:
-            conn.execute(
-                "INSERT INTO users (email, full_name, password_hash, role, credits, is_verified) VALUES (?, ?, ?, 'superadmin', 99999, 1)",
-                (SUPERADMIN_EMAIL, SUPERADMIN_NAME, pwd_hash)
-            )
-            conn.commit()
-            print(f"[OK] Registered sole Superadmin account from ENV: {SUPERADMIN_EMAIL} / {SUPERADMIN_PASSWORD}")
-        else:
-            conn.execute("UPDATE users SET password_hash = ?, full_name = ?, role = 'superadmin', is_verified = 1, is_banned = 0 WHERE email = ?", (pwd_hash, SUPERADMIN_NAME, SUPERADMIN_EMAIL))
-            conn.commit()
-    except Exception as err:
-        print("[SUPERADMIN SEED NOTICE] Migrating schema to superadmin role...", err)
-        conn.close()
-        from database import reset_db_only_superadmin
-        reset_db_only_superadmin()
-        conn = get_db()
-    # Seed demo datasets if table is empty
-    ds_exists = conn.execute("SELECT id FROM datasets").fetchone()
-    if not ds_exists:
-        import shutil
-        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        
-        # 1. Seed Mirpur Coaching Centers
-        src_mirpur = os.path.join(parent_dir, "coaching_centers_mirpur.xlsx")
-        if os.path.exists(src_mirpur):
-            dest_name = f"seeded_mirpur_{int(time.time())}.xlsx"
-            dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
-            shutil.copy(src_mirpur, dest_path)
-            try:
-                df = pd.read_excel(dest_path)
-                conn.execute(
-                    """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, uploaded_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    ("Coaching Centers in Mirpur, Dhaka", "Coaching Center", "Dhaka", "Dhaka City", "Mirpur", dest_path, len(df), ", ".join(df.columns), 0, 1)
-                )
-                conn.commit()
-                print("[OK] Seeded Coaching Centers in Mirpur.")
-            except Exception as e:
-                print(f"[ERR] Failed to seed Mirpur dataset: {e}")
-
-        # 2. Seed Sanitized Coaching Centers (General)
-        src_sanitized = os.path.join(parent_dir, "sanitized_coaching_centers.xlsx")
-        if os.path.exists(src_sanitized):
-            dest_name = f"seeded_sanitized_{int(time.time())}.xlsx"
-            dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
-            shutil.copy(src_sanitized, dest_path)
-            try:
-                df = pd.read_excel(dest_path)
-                conn.execute(
-                    """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, uploaded_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    ("Verified Coaching Centers - General", "Coaching Center", "Dhaka", "Dhaka City", "Mirpur", dest_path, len(df), ", ".join(df.columns), 0, 1)
-                )
-                conn.commit()
-                print("[OK] Seeded Sanitized Coaching Centers.")
-            except Exception as e:
-                print(f"[ERR] Failed to seed Sanitized dataset: {e}")
-        
-    # Update default datasets to 0 credits (FREE for users)
-    conn.execute("UPDATE datasets SET price_credits = 0 WHERE uploaded_by = 1 OR uploaded_by IS NULL")
-    conn.commit()
-    conn.close()
