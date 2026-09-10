@@ -6,6 +6,8 @@ import uuid
 import base64
 import glob
 import threading
+import queue
+import asyncio
 
 import pandas as pd
 from datetime import datetime, timedelta
@@ -18,7 +20,12 @@ from pydantic import BaseModel, EmailStr
 
 from database import get_db, init_db, _request_db_conns
 from auth import hash_password, verify_password, create_jwt_token, decode_jwt_token
-from scraper import setup_driver, scrape_query, save_to_excel, get_live_frame, clear_scraper_frame, LIVE_FRAMES, is_job_stopped, stop_scraper_job, clear_job_stop
+from scraper import (
+    setup_driver, scrape_query, save_to_excel, get_live_frame, clear_scraper_frame,
+    LIVE_FRAMES, is_job_stopped, stop_scraper_job, clear_job_stop,
+    subscribe_scraper_job, unsubscribe_scraper_job, publish_scraper_event,
+    add_job_log, get_job_recent_logs
+)
 from senders import run_whatsapp_campaign, write_log_to_file, SCREENSHOTS_FOLDER as CAMPAIGN_SCREENSHOTS
 from config import REGIONS, CATEGORIES, BREVO_API_KEY as CONFIG_BREVO_API_KEY, SMTP_USER as CONFIG_SMTP_USER, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, SUPERADMIN_NAME, FRONTEND_URL, BKASH_NUMBER, BKASH_ACCOUNT_TYPE, PATHAO_NUMBER, PATHAO_ACCOUNT_TYPE, CREDIT_PACKAGES
 from email_templates import get_verification_email_html
@@ -66,19 +73,30 @@ def startup_event():
     try:
         from database import get_clean_database_url
         if not get_clean_database_url():
-            print("\n" + "="*70)
             print("[SUPABASE NOTICE] DATABASE_URL is not set yet in backend/.env.")
-            print("Please configure your Supabase PostgreSQL connection string in backend/.env:")
-            print("DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres")
-            print("="*70 + "\n")
             return
-        init_db()
+
         conn = get_db()
-        conn.execute("UPDATE users SET is_banned = 0, is_verified = 1, warning_message = '' WHERE role IN ('admin', 'superadmin') OR email = 'admin@marketingostad.com' OR email = 'admin@databazaar.com'")
-        conn.execute("DELETE FROM banned_ips")
+        try:
+            row = conn.execute("SELECT 1 FROM users LIMIT 1;").fetchone()
+            is_initialized = True
+        except Exception:
+            is_initialized = False
+
+        if not is_initialized:
+            conn.close()
+            init_db()
+            conn = get_db()
+
+        conn.execute("UPDATE users SET is_banned = 0, is_verified = 1, warning_message = '' WHERE role IN ('admin', 'superadmin') OR email = 'admin@databazaar.com'")
+        try:
+            conn.execute("DELETE FROM banned_ips")
+            conn.execute("UPDATE scrape_jobs SET status = 'stopped' WHERE status = 'running'")
+        except Exception:
+            pass
         conn.commit()
         conn.close()
-        print("[OK] Supabase PostgreSQL connected. Admin accounts unbanned automatically on startup.")
+        print("[OK] Supabase PostgreSQL connected and ready.")
     except Exception as e:
         print("[STARTUP DB ERROR]", e)
 
@@ -1006,17 +1024,28 @@ def admin_delete_dataset(dataset_id: str, admin_user: dict = Depends(get_admin_u
 
 def run_background_scrape(job_id, queries, division, district, area, headless=False):
     def log_cb(msg):
-        db = get_db()
-        db.execute("INSERT INTO scrape_logs (job_id, message) VALUES (?, ?)", (job_id, msg))
-        db.commit()
-        db.close()
+        # 1. Stream log line instantly in real-time to active WebSocket subscribers
+        add_job_log(job_id, msg)
+        # 2. Persist immediately to database
+        try:
+            db = get_db()
+            db.execute("INSERT INTO scrape_logs (job_id, message) VALUES (?, ?)", (job_id, msg))
+            db.commit()
+            db.close()
+        except Exception:
+            pass
+
+    def flush_db_logs():
+        pass
 
     driver = None
     all_results = []
     stopped_early = False
 
     try:
+        log_cb("🚀 Initializing automated Chrome browser engine...")
         driver = setup_driver(headless=headless)
+        log_cb("🌐 Chrome browser session established. Ready for Google Maps scraping.")
         for idx, q in enumerate(queries):
             if is_job_stopped(job_id):
                 stopped_early = True
@@ -1071,6 +1100,12 @@ def run_background_scrape(job_id, queries, division, district, area, headless=Fa
         db.close()
         log_cb("Scraper execution halted: 0 records collected.")
 
+    flush_db_logs()
+    publish_scraper_event(job_id, {
+        "type": "job_ended",
+        "status": final_status,
+        "result_count": len(all_results)
+    })
     clear_job_stop(job_id)
 
 # ── Dataset Requests Portal API ──────────────────────────────
@@ -2842,8 +2877,8 @@ def delete_log_file(date: str, current_user: dict = Depends(get_current_user)):
 
 @app.websocket("/ws/scraper/{job_id}/stream")
 async def scraper_live_stream(websocket: WebSocket, job_id: int):
-    """WebSocket endpoint that streams live JPEG frames from the scraper browser.
-    Authenticates via ?token= query param. Only sends frames when content changes."""
+    """WebSocket endpoint that streams live Google Maps JPEG frames, real-time logs,
+    and progress events from the scraper browser without continuous database polling."""
     import asyncio
 
     # Authenticate via query param
@@ -2860,34 +2895,75 @@ async def scraper_live_stream(websocket: WebSocket, job_id: int):
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    await websocket.accept()
+    # 1. Verify job is currently active
+    conn = get_db()
+    job_row = conn.execute("SELECT id, status FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
 
-    last_hash = None
+    if not job_row or job_row["status"] != "running":
+        # Scraper job is not running. Do NOT accept connection or enter streaming loop.
+        # Reject immediately so uvicorn does not establish an open connection.
+        try:
+            await websocket.close(code=4004, reason="Scraper job is not actively running")
+        except Exception:
+            pass
+        return
+
+    event_queue = None
     try:
-        while True:
-            # Check if job is still running
-            conn = get_db()
-            job = conn.execute("SELECT status FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
-            conn.close()
+        await websocket.accept()
+        # Subscribe to live event queue
+        event_queue = subscribe_scraper_job(job_id)
 
-            if not job or job["status"] in ("done", "failed"):
-                await websocket.send_json({"type": "job_ended", "status": job["status"] if job else "not_found"})
+        # Send initial in-memory logs and latest live frame
+        initial_logs = get_job_recent_logs(job_id)
+        if initial_logs:
+            await websocket.send_json({
+                "type": "init_logs",
+                "logs": initial_logs
+            })
+
+        frame = get_live_frame(job_id)
+        if frame and frame.get("data"):
+            await websocket.send_json({
+                "type": "frame",
+                "image": frame["data"]
+            })
+
+        ping_counter = 0
+        while True:
+            # Drain queue with ultra-low latency (0.05s) for instant real-time streaming
+            try:
+                event = await asyncio.to_thread(event_queue.get, True, 0.05)
+            except queue.Empty:
+                # Timeout tick: send keep-alive ping every 5 seconds
+                ping_counter += 1
+                if ping_counter >= 100:
+                    ping_counter = 0
+                    try:
+                        await websocket.send_json({"type": "ping"})
+                    except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
+                        break
+                continue
+
+            ping_counter = 0
+            await websocket.send_json(event)
+
+            # Close connection immediately after sending job_ended
+            if event.get("type") == "job_ended":
+                try:
+                    await websocket.close(code=1000, reason="Scraper job finished")
+                except Exception:
+                    pass
                 break
 
-            # Get latest frame from in-memory buffer
-            frame = get_live_frame(job_id)
-            if frame and frame["hash"] != last_hash:
-                last_hash = frame["hash"]
-                await websocket.send_json({
-                    "type": "frame",
-                    "image": frame["data"],  # base64 JPEG (no data URI prefix)
-                })
-
-            await asyncio.sleep(0.3)  # ~3 FPS max, only sends on change
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
         pass
     except Exception:
         pass
+    finally:
+        if event_queue:
+            unsubscribe_scraper_job(job_id, event_queue)
 
 # ── Screenshot Endpoints (Legacy/Fallback) ─────────────────────────────────
 

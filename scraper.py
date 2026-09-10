@@ -3,6 +3,8 @@ import re
 import os
 import hashlib
 import threading
+import queue
+from datetime import datetime
 from io import BytesIO
 import pandas as pd
 from selenium import webdriver
@@ -12,15 +14,81 @@ from selenium.webdriver.chrome.options import Options
 SCROLL_TIMES = 10
 WAIT_TIME = 2
 
-# ── In-memory live frame buffer for WebSocket streaming ──
-# Stores the latest JPEG frame per job_id: { job_id: { "data": base64_str, "hash": md5_hex } }
+# ── In-memory live event & frame buffer for WebSocket streaming ──
 LIVE_FRAMES: dict[int, dict] = {}
 _frame_lock = threading.Lock()
+
+JOB_SUBSCRIBERS: dict[int, set] = {}
+_sub_lock = threading.Lock()
+
+JOB_RECENT_LOGS: dict[int, list[str]] = {}
+_logs_lock = threading.Lock()
+
+def add_job_log(job_id: int, message: str) -> str:
+    """Record a formatted log line in memory and broadcast in real-time to active WebSocket subscribers"""
+    formatted = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    if job_id:
+        jid = int(job_id)
+        with _logs_lock:
+            if jid not in JOB_RECENT_LOGS:
+                JOB_RECENT_LOGS[jid] = []
+            JOB_RECENT_LOGS[jid].append(formatted)
+            if len(JOB_RECENT_LOGS[jid]) > 500:
+                JOB_RECENT_LOGS[jid] = JOB_RECENT_LOGS[jid][-300:]
+
+        publish_scraper_event(jid, {"type": "log", "message": formatted})
+    return formatted
+
+def get_job_recent_logs(job_id: int) -> list[str]:
+    """Retrieve in-memory logs for a job without touching the database"""
+    if not job_id:
+        return []
+    with _logs_lock:
+        return list(JOB_RECENT_LOGS.get(int(job_id), []))
+
+def subscribe_scraper_job(job_id: int) -> queue.Queue:
+    """Subscribe a WebSocket worker to real-time events for a specific scraper job"""
+    q = queue.Queue(maxsize=150)
+    jid = int(job_id)
+    with _sub_lock:
+        if jid not in JOB_SUBSCRIBERS:
+            JOB_SUBSCRIBERS[jid] = set()
+        JOB_SUBSCRIBERS[jid].add(q)
+    return q
+
+def unsubscribe_scraper_job(job_id: int, q: queue.Queue):
+    """Unsubscribe a WebSocket worker"""
+    if not job_id:
+        return
+    jid = int(job_id)
+    with _sub_lock:
+        if jid in JOB_SUBSCRIBERS:
+            JOB_SUBSCRIBERS[jid].discard(q)
+            if not JOB_SUBSCRIBERS[jid]:
+                JOB_SUBSCRIBERS.pop(jid, None)
+
+def publish_scraper_event(job_id: int, event: dict):
+    """Push an event to all live subscribers of a job without touching the database"""
+    if not job_id:
+        return
+    jid = int(job_id)
+    with _sub_lock:
+        subscribers = list(JOB_SUBSCRIBERS.get(jid, []))
+    for q in subscribers:
+        try:
+            q.put_nowait(event)
+        except queue.Full:
+            try:
+                q.get_nowait()
+                q.put_nowait(event)
+            except Exception:
+                pass
 
 def push_scraper_frame(driver, job_id):
     """Capture a compressed JPEG frame and store it in the in-memory buffer"""
     if not job_id:
         return
+    jid = int(job_id)
     try:
         # Get screenshot as PNG bytes from Selenium
         png_bytes = driver.get_screenshot_as_png()
@@ -44,19 +112,27 @@ def push_scraper_frame(driver, job_id):
         frame_hash = hashlib.md5(jpeg_bytes).hexdigest()
 
         with _frame_lock:
-            LIVE_FRAMES[job_id] = {"data": b64_data, "hash": frame_hash}
+            LIVE_FRAMES[jid] = {"data": b64_data, "hash": frame_hash}
+        publish_scraper_event(jid, {"type": "frame", "image": b64_data})
     except Exception:
         pass
 
 def get_live_frame(job_id: int) -> dict | None:
     """Get the latest frame for a job (thread-safe)"""
+    if not job_id:
+        return None
     with _frame_lock:
-        return LIVE_FRAMES.get(job_id)
+        return LIVE_FRAMES.get(int(job_id))
 
 def clear_scraper_frame(job_id: int):
-    """Clean up frame buffer when a job finishes"""
+    """Keep the last captured frame for user review until memory threshold is reached"""
     with _frame_lock:
-        LIVE_FRAMES.pop(job_id, None)
+        if len(LIVE_FRAMES) > 25:
+            try:
+                oldest = next(iter(LIVE_FRAMES))
+                LIVE_FRAMES.pop(oldest, None)
+            except Exception:
+                pass
 
 # Backward-compatible alias — all existing call sites use this name
 save_scraper_screenshot = push_scraper_frame
@@ -146,42 +222,46 @@ def extract_phone(text):
             return num
     return ''
 
-def scroll_results(driver, scroll_times=10, log_cb=print):
-    """Scroll Google Maps sidebar panel"""
+def scroll_results(driver, scroll_times=8, log_cb=print, job_id=None):
+    """Scroll Google Maps sidebar panel with immediate live visual feedback"""
     try:
         panel = driver.find_element(By.CSS_SELECTOR, 'div[role="feed"]')
         for i in range(scroll_times):
             driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", panel)
-            time.sleep(1.5)
-            log_cb(f"Scrolling maps sidebar feed... {i+1}/{scroll_times}")
+            log_cb(f"📜 [SCROLL {i+1}/{scroll_times}] Feed scroll performed. Loading more places...")
+            if job_id:
+                push_scraper_frame(driver, job_id)
+            time.sleep(1.0)
     except Exception as e:
-        log_cb(f"Sidebar scroll skipped: {e}")
+        log_cb(f"⚠️ [SCROLL] Sidebar scroll skipped: {e}")
 
 def scrape_query(driver, query, log_cb=print, job_id=None):
-    """Scrape a search query from Google Maps"""
+    """Scrape a search query from Google Maps with live step-by-step debugger tracking"""
     results = []
-    log_cb(f"Starting Google Maps search query: '{query}'")
-
     url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
+    log_cb(f"🌐 [NAVIGATE] Loading Google Maps URL: {url}")
+
     driver.get(url)
-    time.sleep(3)
-    save_scraper_screenshot(driver, job_id)
+    if job_id:
+        push_scraper_frame(driver, job_id)
+    time.sleep(2.5)
+    log_cb(f"📍 [RENDERED] Google Maps page loaded for query: '{query}'")
+    if job_id:
+        push_scraper_frame(driver, job_id)
 
-    # Scroll sidebar
-    scroll_results(driver, SCROLL_TIMES, log_cb)
-    time.sleep(2)
-    save_scraper_screenshot(driver, job_id)
-
-
+    # Scroll sidebar with live frame updates
+    scroll_results(driver, 8, log_cb, job_id=job_id)
+    if job_id:
+        push_scraper_frame(driver, job_id)
 
     listings = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/maps/place/"]')
-    log_cb(f"Discovered {len(listings)} business elements on the page.")
+    log_cb(f"🎯 [DISCOVERY] Found {len(listings)} place links on page. Beginning item extraction...")
 
     seen_names = set()
 
     for i, listing in enumerate(listings):
         if is_job_stopped(job_id):
-            log_cb("⏹️ Interruption / Stop signal received. Halting scrape for current query...")
+            log_cb("⏹️ [HALT] Interruption / Stop signal received. Halting current scrape query...")
             break
 
         try:
@@ -192,10 +272,14 @@ def scrape_query(driver, query, log_cb=print, job_id=None):
                 continue
             seen_names.add(name)
 
+            log_cb(f"🔍 [INSPECT #{len(results)+1}] Clicking '{name}'...")
             # Click to load details
             driver.execute_script("arguments[0].click();", listing)
-            time.sleep(2)
-            save_scraper_screenshot(driver, job_id)
+            if job_id:
+                push_scraper_frame(driver, job_id)
+            time.sleep(1.2)
+            if job_id:
+                push_scraper_frame(driver, job_id)
 
             phone = ''
             address = ''
@@ -266,15 +350,22 @@ def scrape_query(driver, query, log_cb=print, job_id=None):
                 "Query": query,
             }
             results.append(entry)
-            status_tag = "[OK]" if phone else "[NO PHONE]"
-            log_cb(f"Scraped listing: {name[:30]} {status_tag} {phone}")
-            if i % 2 == 0:
-                save_scraper_screenshot(driver, job_id)
 
+            phone_badge = f"📞 {phone}" if phone else "⚠️ No phone"
+            addr_snippet = f"| 📍 {address[:30]}" if address else ""
+            log_cb(f"✅ [SAVED #{len(results)}] '{name}' | {phone_badge} {addr_snippet}")
 
+            publish_scraper_event(job_id, {
+                "type": "progress",
+                "count": len(results),
+                "action": f"Extracted #{len(results)}: {name}",
+                "item": {"name": name, "phone": phone, "category": category, "address": address}
+            })
+            if job_id:
+                push_scraper_frame(driver, job_id)
 
         except Exception as e:
-            log_cb(f"Error extracting listing index {i+1}: {e}")
+            log_cb(f"⚠️ [WARN] Error parsing listing #{i+1}: {e}")
             continue
 
     return results
