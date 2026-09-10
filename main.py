@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
-from database import get_db, init_db
+from database import get_db, init_db, _request_db_conns
 from auth import hash_password, verify_password, create_jwt_token, decode_jwt_token
 from scraper import setup_driver, scrape_query, save_to_excel, get_live_frame, clear_scraper_frame, LIVE_FRAMES, is_job_stopped, stop_scraper_job, clear_job_stop
 from senders import run_whatsapp_campaign, write_log_to_file, SCREENSHOTS_FOLDER as CAMPAIGN_SCREENSHOTS
@@ -24,6 +24,22 @@ from config import REGIONS, CATEGORIES, BREVO_API_KEY as CONFIG_BREVO_API_KEY, S
 from email_templates import get_verification_email_html
 
 app = FastAPI(title="MarketingOstad API Service")
+
+@app.middleware("http")
+async def db_connection_lifecycle_middleware(request: Request, call_next):
+    token = _request_db_conns.set([])
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        conns = _request_db_conns.get()
+        if conns:
+            for conn in conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        _request_db_conns.reset(token)
 
 # Allow CORS for React frontend (standard dev port 5173 / 3000 / localhost)
 app.add_middleware(
@@ -68,6 +84,8 @@ def startup_event():
 
 # ── Dependencies ─────────────────────────────────────────
 
+_user_auth_cache = {}  # {token: (timestamp, user_dict)}
+
 def get_current_user(request: Request, authorization: Optional[str] = Header(None), token: Optional[str] = None):
     raw_token = None
     if authorization and authorization.startswith("Bearer "):
@@ -87,6 +105,12 @@ def get_current_user(request: Request, authorization: Optional[str] = Header(Non
             detail="Session expired or invalid login token."
         )
     
+    # Fast in-memory cache for concurrent requests (8s TTL)
+    now = time.time()
+    cached = _user_auth_cache.get(raw_token)
+    if cached and (now - cached[0] < 8):
+        return cached[1]
+
     # Retrieve user from DB
     conn = get_db()
     
@@ -114,7 +138,9 @@ def get_current_user(request: Request, authorization: Optional[str] = Header(Non
             detail=user["warning_message"] or "Your account has been suspended for security policy violations."
         )
         
-    return dict(user)
+    user_dict = dict(user)
+    _user_auth_cache[raw_token] = (now, user_dict)
+    return user_dict
 
 def get_admin_user(current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in ("admin", "superadmin"):
@@ -1261,7 +1287,7 @@ def get_job_status(job_id: int, current_user: dict = Depends(get_current_user)):
     conn.close()
     return {
         "job": dict(job),
-        "logs": [f"[{l['created_at'].split(' ')[1] if ' ' in l['created_at'] else l['created_at']}] {l['message']}" for l in logs]
+        "logs": [f"[{str(l['created_at']).split(' ')[1] if ' ' in str(l['created_at']) else str(l['created_at'])}] {l['message']}" for l in logs]
     }
 
 @app.delete("/api/scraper/jobs/{job_id}")
@@ -2104,7 +2130,7 @@ def get_campaign_status(campaign_id: str, current_user: dict = Depends(get_curre
         "est_human": eta_info["est_human"],
         "est_completion_time": eta_info["est_completion_time"],
         "progress_percent": eta_info["progress_percent"],
-        "logs": [f"[{l['created_at'].split(' ')[1] if ' ' in l['created_at'] else l['created_at']}] {l['message']}" for l in logs]
+        "logs": [f"[{str(l['created_at']).split(' ')[1] if ' ' in str(l['created_at']) else str(l['created_at'])}] {l['message']}" for l in logs]
     }
 
 @app.post("/api/marketing/whatsapp-campaign/{campaign_id}/stop")
@@ -2500,8 +2526,14 @@ def unregister_user(target_user_id: int, admin_user: dict = Depends(get_admin_us
 
 # ── Admin Dashboard Overview Endpoint ─────────────────────
 
+_dashboard_cache = {"timestamp": 0, "data": None}
+
 @app.get("/api/admin/dashboard-overview")
-def admin_dashboard_overview(admin_user: dict = Depends(get_admin_user)):
+def admin_dashboard_overview(refresh: bool = False, admin_user: dict = Depends(get_admin_user)):
+    now = time.time()
+    if not refresh and _dashboard_cache["data"] is not None and (now - _dashboard_cache["timestamp"] < 6):
+        return _dashboard_cache["data"]
+
     conn = get_db()
 
     # 1. User Stats
@@ -2512,7 +2544,7 @@ def admin_dashboard_overview(admin_user: dict = Depends(get_admin_user)):
     banned_count = 0
     for u in users_list:
         role_counts[u["role"]] = role_counts.get(u["role"], 0) + 1
-        if u.get("is_banned") == 1:
+        if u.get("is_banned") in (1, True, "1", "true"):
             banned_count += 1
 
     # 2. Payment Stats
@@ -2533,9 +2565,9 @@ def admin_dashboard_overview(admin_user: dict = Depends(get_admin_user)):
         if s == "approved":
             total_revenue_bdt += p.get("amount_bdt", 0)
             # Monthly revenue aggregation
-            created = p.get("created_at", "")
-            if created and len(created) >= 7:
-                month_key = created[:7]  # YYYY-MM
+            created = p.get("created_at")
+            if created:
+                month_key = str(created)[:7]  # YYYY-MM
                 monthly_revenue[month_key] = monthly_revenue.get(month_key, 0) + p.get("amount_bdt", 0)
         pkg = p.get("package_name", "Unknown")
         package_popularity[pkg] = package_popularity.get(pkg, 0) + 1
@@ -2583,9 +2615,7 @@ def admin_dashboard_overview(admin_user: dict = Depends(get_admin_user)):
     # 5. Total catalog datasets
     total_catalog = conn.execute("SELECT COUNT(*) as cnt FROM datasets WHERE is_active = 1").fetchone()["cnt"]
 
-    conn.close()
-
-    return {
+    overview_data = {
         "user_stats": {
             "total_users": total_users,
             "role_counts": role_counts,
@@ -2612,6 +2642,10 @@ def admin_dashboard_overview(admin_user: dict = Depends(get_admin_user)):
         },
         "users_with_datasets": users_with_datasets,
     }
+
+    _dashboard_cache["timestamp"] = now
+    _dashboard_cache["data"] = overview_data
+    return overview_data
 
 
 @app.get("/api/admin/users/{user_id}/private-datasets")

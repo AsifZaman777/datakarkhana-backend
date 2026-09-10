@@ -1,5 +1,8 @@
 import os
 import re
+import time
+import gc
+import contextvars
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
@@ -194,19 +197,22 @@ class PostgresConnectionWrapper:
     def close(self):
         if not self._closed:
             self._closed = True
-            if self._pool and self._conn:
+            conn = self._conn
+            pool = self._pool
+            self._conn = None
+            if pool and conn:
                 try:
-                    if not self._conn.closed:
-                        self._conn.rollback()
-                    self._pool.putconn(self._conn)
+                    if not conn.closed:
+                        conn.rollback()
+                    pool.putconn(conn)
                 except Exception:
                     try:
-                        self._pool.putconn(self._conn, close=True)
+                        pool.putconn(conn, close=True)
                     except Exception:
                         pass
-            elif self._conn and not self._conn.closed:
+            elif conn and not conn.closed:
                 try:
-                    self._conn.close()
+                    conn.close()
                 except Exception:
                     pass
 
@@ -228,6 +234,7 @@ class PostgresConnectionWrapper:
 
 # ── Connection Pool Management ─────────────────────────────────
 _db_pool = None
+_request_db_conns = contextvars.ContextVar("_request_db_conns", default=None)
 
 def get_pool():
     global _db_pool
@@ -239,22 +246,27 @@ def get_pool():
                 "Please configure your Supabase PostgreSQL connection string, e.g.:\n"
                 "DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres"
             )
-        _db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=url)
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=5, maxconn=40, dsn=url)
     return _db_pool
 
 def get_db():
     pool = get_pool()
     raw_conn = None
-    for attempt in range(2):
+    max_retries = 20
+    for attempt in range(max_retries):
         try:
             raw_conn = pool.getconn()
             if raw_conn.closed != 0:
                 pool.putconn(raw_conn, close=True)
                 raw_conn = None
                 continue
-            with raw_conn.cursor() as test_cur:
-                test_cur.execute("SELECT 1;")
             break
+        except psycopg2.pool.PoolError:
+            # Pool momentarily saturated: force GC to clean dropped wrappers and retry
+            gc.collect()
+            time.sleep(0.02)
+            if attempt == max_retries - 1:
+                raise
         except Exception:
             if raw_conn is not None:
                 try:
@@ -262,11 +274,21 @@ def get_db():
                 except Exception:
                     pass
                 raw_conn = None
-            if attempt == 1:
+            if attempt >= 2:
                 raise
+            time.sleep(0.02)
+
     if raw_conn is None:
         raw_conn = pool.getconn()
-    return PostgresConnectionWrapper(raw_conn, pool)
+
+    wrapper = PostgresConnectionWrapper(raw_conn, pool)
+
+    # Automatically track with current HTTP request context if inside a web request
+    active_conns = _request_db_conns.get()
+    if active_conns is not None:
+        active_conns.append(wrapper)
+
+    return wrapper
 
 # ── Schema Initialization & Migrations ─────────────────────────
 def init_db():
