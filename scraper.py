@@ -85,9 +85,37 @@ def publish_scraper_event(job_id: int, event: dict):
                 pass
 
 def push_scraper_frame(driver, job_id):
-    """Fast no-op: screenshot capturing disabled for ultra-lightweight zero-lag scraping"""
-    return
+    """Capture a compressed JPEG frame and store it in the in-memory buffer"""
+    if not job_id:
+        return
+    jid = int(job_id)
+    try:
+        # Get screenshot as PNG bytes from Selenium
+        png_bytes = driver.get_screenshot_as_png()
 
+        # Compress to JPEG using Pillow for smaller frames (~20-50KB vs ~500KB PNG)
+        from PIL import Image as PILImage
+        img = PILImage.open(BytesIO(png_bytes))
+
+        # Resize to max 800px width to keep frames lightweight
+        max_width = 800
+        if img.width > max_width:
+            ratio = max_width / img.width
+            img = img.resize((max_width, int(img.height * ratio)), PILImage.LANCZOS)
+
+        buffer = BytesIO()
+        img.save(buffer, format="JPEG", quality=40, optimize=True)
+        jpeg_bytes = buffer.getvalue()
+
+        import base64
+        b64_data = base64.b64encode(jpeg_bytes).decode("utf-8")
+        frame_hash = hashlib.md5(jpeg_bytes).hexdigest()
+
+        with _frame_lock:
+            LIVE_FRAMES[jid] = {"data": b64_data, "hash": frame_hash}
+        publish_scraper_event(jid, {"type": "frame", "image": b64_data})
+    except Exception:
+        pass
 
 def get_live_frame(job_id: int) -> dict | None:
     """Get the latest frame for a job (thread-safe)"""
@@ -145,22 +173,8 @@ def setup_driver(headless=True):
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    # ⚡ ULTRA-LIGHTWEIGHT ENGINE: 100% Block all images, 3D tiles, and media downloads
-    prefs = {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.default_content_setting_values.notifications": 2,
-        "profile.default_content_setting_values.geolocation": 2,
-        "profile.default_content_setting_values.media_stream": 2,
-        "profile.default_content_setting_values.plugins": 2,
-    }
-    options.add_experimental_option("prefs", prefs)
-    options.add_argument("--blink-settings=imagesEnabled=false")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-sync")
-    options.add_argument("--disable-default-apps")
-    options.add_argument("--no-first-run")
-    options.add_argument("--window-size=1280,720")
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("--window-size=1400,900")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
@@ -180,20 +194,6 @@ def setup_driver(headless=True):
 
     driver = webdriver.Chrome(options=options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-    # ⚡ Network-level blocker: Block Google Photos, StreetView tiles, WebFonts, and Video
-    try:
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": [
-                "*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.svg", "*.ico",
-                "*.woff", "*.woff2", "*.ttf", "*.otf",
-                "*.mp4", "*.webm",
-                "*googleusercontent.com*", "*streetviewpixels*", "*geo0.ggpht.com*"
-            ]
-        })
-    except Exception:
-        pass
 
     # Prevent reload interception & beforeunload popups via CDP
     try:
