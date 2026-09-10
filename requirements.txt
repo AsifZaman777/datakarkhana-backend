@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic[email]
+pyjwt
+python-multipart
+selenium
+pandas
+openpyxl
+jinja2

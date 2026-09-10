@@ -1,0 +1,110 @@
+{
+  "cost_assumptions_bdt_peak": {
+    "note": "Conservative, small-scale/peak estimates. Recalculate with real invoices once you pick a host and proxy provider.",
+    "scrape_query_bdt": 1.7,
+    "whatsapp_message_bdt": 0.25,
+    "email_send_bdt": 0.22,
+    "catalog_unlock_bdt": 0.08,
+    "highest_cost_path_per_credit_bdt": 2.2,
+    "recommended_floor_bdt_per_credit": 2.5
+  },
+  "credit_consumption": {
+    "catalog_lead_unlock": {
+      "credits": 1,
+      "unit": "1 lead unlocked"
+    },
+    "custom_scrape_query": {
+      "credits": 1,
+      "unit": "1 query, up to ~50 results",
+      "note": "Consider 2 credits for broad/multi-area or 100+ result queries"
+    },
+    "whatsapp_send": {
+      "credits": 1,
+      "unit": "5 successful (delivered) sends",
+      "note": "Only counts confirmed delivery, never failed attempts"
+    },
+    "email_send": {
+      "credits": 1,
+      "unit": "10 successful sends via Brevo",
+      "note": "Only counts confirmed accepted/sent status, never bounces"
+    }
+  },
+  "packages": [
+    {
+      "id": "starter",
+      "name": "Starter Lead Pack",
+      "credits": 50,
+      "price_bdt": 350,
+      "price_per_credit_bdt": 7,
+      "popular": false,
+      "badge": "Starter",
+      "description": "Ideal for small outreach campaigns & testing.",
+      "features": [
+        "50 Verified Lead Credits",
+        "Full Phone & Email Access",
+        "Unlimited Public Dataset Access",
+        "Generate 10 Private Dataset",
+        "Unlimited WhatsApp Campaign (max 250 leads/day)",
+        "Standard Support"
+      ]
+    },
+    {
+      "id": "pro",
+      "name": "Pro Growth Pack",
+      "credits": 100,
+      "price_bdt": 550,
+      "price_per_credit_bdt": 5.5,
+      "popular": true,
+      "badge": "Most Popular",
+      "save_badge": "🔥 Save 1.5 Taka/Credit",
+      "description": "Best value! Power your WhatsApp & Email campaigns.",
+      "features": [
+        "200 Verified Lead Credits",
+        "Full Phone & Email Access",
+        "Global Google map Scraping",
+        "Priority Dataset Requests",
+        "Unlimited Public Dataset Access",
+        "Generate 5x Private Dataset than STARTER",
+        "Unlimited WhatsApp Campaign (max 350 leads/day)",
+        "Unlimited Email Campaign (max 250 leads/day)",
+        "24/7 Priority Support"
+      ]
+    },
+    {
+      "id": "enterprise",
+      "name": "Enterprise Mega Pack",
+      "credits": 500,
+      "price_bdt": 2500,
+      "price_per_credit_bdt": 5,
+      "popular": false,
+      "badge": "Agency Choice",
+      "save_badge": "🔥 Save 2.0 Taka/Credit",
+      "description": "Maximum credits for high-volume agency scraping.",
+      "features": [
+        "500 Verified Lead Credits",
+        "Full Phone & Email Access",
+        "Global Google map Scraping",
+        "Instant Public Catalog Unlocks",
+        "Generate 10x Private Dataset than PRO",
+        "Unlimited WhatsApp Campaign (unlimited)",
+        "Unlimited Email Campaign (~10000/month)",
+        "Dedicated Account Manager",
+        "SEO and Digital marketing support",
+        "Custom Location & Niche Requests"
+      ]
+    }
+  ],
+  "custom_package": {
+    "name": "Custom Upgrade",
+    "price_per_credit_bdt": 7.5,
+    "min_credits": 5,
+    "max_credits": 500,
+    "step": 10,
+    "description": "Select the exact credit amount your team requires:",
+    "features": [
+      "Custom Flexible Credit Top-up",
+      "Instant Account Balance Unlocks",
+      "Full Access to All Catalogs"
+    ]
+  }
+}
