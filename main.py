@@ -13,7 +13,7 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
-from fastapi import FastAPI, Depends, HTTPException, status, Header, BackgroundTasks, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, status, Header, BackgroundTasks, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -480,6 +480,42 @@ def resolve_frontend_base_url(request: Optional[Request] = None) -> str:
         return FRONTEND_LOCAL_URL.rstrip("/")
 
     return "http://localhost:3000"
+
+@app.get("/api/download/desktop")
+def download_desktop_app(os_name: str = Query("windows", alias="os")):
+    """Serves the standalone Desktop application installer for Windows or Mac."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    dist_dir = os.path.abspath(os.path.join(base_dir, "..", "desktop", "dist"))
+
+    clean_os = (os_name or "windows").lower().strip()
+    if clean_os in ("win", "windows"):
+        candidates = [
+            os.path.join(dist_dir, "DataKarkhana Desktop Setup 2.0.0.exe"),
+            os.path.join(dist_dir, "DataKarkhana Desktop Setup.exe"),
+            os.path.join(dist_dir, "win-unpacked", "DataKarkhana Desktop.exe"),
+        ]
+        filename = "DataKarkhana_Desktop_Setup_v2.exe"
+    elif clean_os in ("mac", "macos", "darwin", "apple"):
+        candidates = [
+            os.path.join(dist_dir, "DataKarkhana Desktop-2.0.0-arm64.dmg"),
+            os.path.join(dist_dir, "DataKarkhana Desktop-2.0.0.dmg"),
+        ]
+        filename = "DataKarkhana_Desktop_Mac_v2.dmg"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid OS specified. Please use ?os=windows or ?os=mac")
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return FileResponse(
+                path=candidate,
+                filename=filename,
+                media_type="application/octet-stream"
+            )
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Desktop installer for {clean_os} not found in build directory. Please compile with electron-builder first."
+    )
 
 @app.post("/api/auth/register")
 def register(req: RegisterRequest, request: Request):
