@@ -14,7 +14,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 from fastapi import FastAPI, Depends, HTTPException, status, Header, BackgroundTasks, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
@@ -483,11 +483,29 @@ def resolve_frontend_base_url(request: Optional[Request] = None) -> str:
 
 @app.get("/api/download/desktop")
 def download_desktop_app(os_name: str = Query("windows", alias="os")):
-    """Serves the standalone Desktop application installer for Windows or Mac."""
+    """Serves the standalone Desktop application installer for Windows or Mac.
+    Supports:
+    1. Direct Cloud Storage / GitHub Release redirect (DESKTOP_MAC_DOWNLOAD_URL / DESKTOP_WIN_DOWNLOAD_URL)
+    2. Local file serving when compiled locally on developer machine.
+    """
+    clean_os = (os_name or "windows").lower().strip()
+
+    # 1. Cloud URL redirect (for Vercel / Render cloud deployments)
+    if clean_os in ("mac", "macos", "darwin", "apple"):
+        cloud_url = os.getenv("DESKTOP_MAC_DOWNLOAD_URL") or os.getenv("MAC_DOWNLOAD_URL")
+        if cloud_url:
+            return RedirectResponse(url=cloud_url.strip(), status_code=302)
+    elif clean_os in ("win", "windows"):
+        cloud_url = os.getenv("DESKTOP_WIN_DOWNLOAD_URL") or os.getenv("WIN_DOWNLOAD_URL")
+        if cloud_url:
+            return RedirectResponse(url=cloud_url.strip(), status_code=302)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid OS specified. Please use ?os=windows or ?os=mac")
+
+    # 2. Local file lookup in desktop/dist (for local development)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     dist_dir = os.path.abspath(os.path.join(base_dir, "..", "desktop", "dist"))
 
-    clean_os = (os_name or "windows").lower().strip()
     if clean_os in ("win", "windows"):
         candidates = [
             os.path.join(dist_dir, "DataKarkhana Desktop Setup 2.0.0.exe"),
@@ -495,14 +513,12 @@ def download_desktop_app(os_name: str = Query("windows", alias="os")):
             os.path.join(dist_dir, "win-unpacked", "DataKarkhana Desktop.exe"),
         ]
         filename = "DataKarkhana_Desktop_Setup_v2.exe"
-    elif clean_os in ("mac", "macos", "darwin", "apple"):
+    else:
         candidates = [
             os.path.join(dist_dir, "DataKarkhana Desktop-2.0.0-arm64.dmg"),
             os.path.join(dist_dir, "DataKarkhana Desktop-2.0.0.dmg"),
         ]
         filename = "DataKarkhana_Desktop_Mac_v2.dmg"
-    else:
-        raise HTTPException(status_code=400, detail="Invalid OS specified. Please use ?os=windows or ?os=mac")
 
     for candidate in candidates:
         if os.path.exists(candidate):
@@ -512,9 +528,15 @@ def download_desktop_app(os_name: str = Query("windows", alias="os")):
                 media_type="application/octet-stream"
             )
 
+    support_email = os.getenv("SUPPORT_EMAIL", "asifdev777@gmail.com")
+    hotline = os.getenv("HOTLINE_PHONE", "+880 1824500704")
     raise HTTPException(
         status_code=404,
-        detail=f"Desktop installer for {clean_os} not found in build directory. Please compile with electron-builder first."
+        detail=(
+            f"Desktop installer for {clean_os} is not hosted on this cloud server disk. "
+            f"Please set DESKTOP_{clean_os.upper()}_DOWNLOAD_URL in your cloud environment variables, "
+            f"or contact WhatsApp ({hotline}) / email ({support_email}) to receive the download link."
+        )
     )
 
 @app.post("/api/auth/register")
