@@ -21,6 +21,12 @@ from pydantic import BaseModel, EmailStr
 
 from database import get_db, init_db, _request_db_conns
 from auth import hash_password, verify_password, create_jwt_token, decode_jwt_token
+from license_service import (
+    generate_production_license,
+    verify_license,
+    activate_license,
+    get_current_license_status
+)
 from scraper import (
     setup_driver, scrape_query, save_to_excel, get_live_frame, clear_scraper_frame,
     LIVE_FRAMES, is_job_stopped, stop_scraper_job, clear_job_stop,
@@ -29,7 +35,7 @@ from scraper import (
 )
 from senders import run_whatsapp_campaign, write_log_to_file, SCREENSHOTS_FOLDER as CAMPAIGN_SCREENSHOTS
 from config import REGIONS, CATEGORIES, BREVO_API_KEY as CONFIG_BREVO_API_KEY, SMTP_USER as CONFIG_SMTP_USER, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, SUPERADMIN_NAME, FRONTEND_URL, FRONTEND_LOCAL_URL, FRONTEND_RENDER_URL, FRONTEND_MODE, BKASH_NUMBER, BKASH_ACCOUNT_TYPE, PATHAO_NUMBER, PATHAO_ACCOUNT_TYPE, CREDIT_PACKAGES
-from email_templates import get_verification_email_html
+from email_templates import get_verification_email_html, get_license_key_email_html
 
 app = FastAPI(title="MarketingOstad API Service")
 
@@ -219,6 +225,31 @@ def get_current_user(request: Request, authorization: Optional[str] = Header(Non
     _user_auth_cache[raw_token] = (now, user_dict)
     return user_dict
 
+def get_optional_current_user(request: Request, authorization: Optional[str] = Header(None), token: Optional[str] = None) -> Optional[dict]:
+    """Extracts current user if Authorization Bearer token is present, else None without raising 401."""
+    try:
+        raw_token = None
+        if authorization and authorization.startswith("Bearer "):
+            raw_token = authorization.split(" ")[1]
+        elif token:
+            raw_token = token
+
+        if not raw_token:
+            return None
+
+        user_payload = decode_jwt_token(raw_token)
+        if not user_payload:
+            return None
+
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_payload["user_id"],)).fetchone()
+        conn.close()
+        if not user or user["is_banned"] == 1:
+            return None
+        return dict(user)
+    except Exception:
+        return None
+
 def get_admin_user(current_user: dict = Depends(get_current_user)):
     if current_user["role"] not in ("admin", "superadmin"):
         raise HTTPException(
@@ -226,6 +257,25 @@ def get_admin_user(current_user: dict = Depends(get_current_user)):
             detail="Administrator access is required."
         )
     return current_user
+
+def check_desktop_license(current_user: dict = Depends(get_current_user)):
+    """Ensures local desktop scraping/operations are licensed and not expired"""
+    if current_user.get("role") in ("superadmin", "admin"):
+        return True
+
+    lic = get_current_license_status(current_user)
+    if not lic.get("valid"):
+        if lic.get("is_expired"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"License Expired: Your desktop production license expired on {lic.get('expires_at')}. Please enter an updated production key."
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="License Required: Please activate your desktop app with a production key in the Subscribe panel to run local operations."
+            )
+    return True
 
 # ── Schemas ──────────────────────────────────────────────
 
@@ -295,24 +345,31 @@ class BrevoActivateLinkRequest(BaseModel):
 
 # ── Free Brevo API Helper ────────────────────────────────
 
-def send_free_verification_email(recipient_email: str, full_name: str, verify_link: str):
+def generate_otp() -> str:
+    import secrets
+    return f"{secrets.randbelow(900000) + 100000}"
+
+def send_free_verification_email(recipient_email: str, full_name: str, otp_code: str):
     brevo_api_key = os.getenv("BREVO_API_KEY", "")
     sender_email = os.getenv("SENDER_EMAIL", os.getenv("SUPPORT_EMAIL", os.getenv("SMTP_USER", "asifdev777@gmail.com")))
 
-    html_body = get_verification_email_html(full_name, verify_link)
+    html_body = get_verification_email_html(full_name, otp_code)
     last_error = ""
 
-    if not brevo_api_key:
-        return False, "BREVO_API_KEY is not configured in backend .env file."
+    print(f"[OTP CODE GENERATED] Verification Code for {recipient_email}: {otp_code}")
 
-    # Use Brevo REST API directly (no SMTP)
+    if not brevo_api_key:
+        print(f"[BREVO NOTICE] BREVO_API_KEY is not set. In local dev mode, OTP is: {otp_code}")
+        return True, ""
+
+    # Use Brevo REST API directly
     try:
         import urllib.request
         url = "https://api.brevo.com/v3/smtp/email"
         payload = {
-            "sender": {"name": "MarketingOstad Platform", "email": sender_email},
+            "sender": {"name": "DataKarkhana Platform", "email": sender_email},
             "to": [{"email": recipient_email, "name": full_name}],
-            "subject": "Verify Your MarketingOstad Account Email",
+            "subject": f"Your DataKarkhana Verification Code: {otp_code}",
             "htmlContent": html_body
         }
         req = urllib.request.Request(
@@ -326,7 +383,7 @@ def send_free_verification_email(recipient_email: str, full_name: str, verify_li
         )
         with urllib.request.urlopen(req) as resp:
             if resp.status in (200, 201):
-                print(f"[BREVO API SUCCESS] Verification email sent to {recipient_email} via Brevo API!")
+                print(f"[BREVO API SUCCESS] Verification code {otp_code} sent to {recipient_email} via Brevo API!")
                 return True, ""
     except urllib.error.HTTPError as ex:
         err_body = ex.read().decode("utf-8")
@@ -340,7 +397,50 @@ def send_free_verification_email(recipient_email: str, full_name: str, verify_li
         print(f"[BREVO API ERROR] {ex}")
         last_error = str(ex)
 
-    return False, last_error
+    # In local development, if Brevo fails, don't block registration
+    print(f"[DEV FALLBACK] Brevo error: {last_error}. Local OTP code remains: {otp_code}")
+    return True, last_error
+
+
+def send_license_key_email(recipient_email: str, customer_name: str, production_key: str, plan_name: str, credits: int, expires_at: str):
+    """Sends the production license key to the customer via Brevo transactional email after payment approval."""
+    brevo_api_key = os.getenv("BREVO_API_KEY", "")
+    sender_email = os.getenv("SENDER_EMAIL", os.getenv("SUPPORT_EMAIL", os.getenv("SMTP_USER", "asifdev777@gmail.com")))
+
+    if not brevo_api_key:
+        print("[LICENSE EMAIL SKIP] BREVO_API_KEY not configured. License key email not sent.")
+        return False, "BREVO_API_KEY is not configured."
+
+    html_body = get_license_key_email_html(customer_name, production_key, plan_name, credits, expires_at)
+
+    try:
+        import urllib.request
+        url = "https://api.brevo.com/v3/smtp/email"
+        payload = {
+            "sender": {"name": "DataKarkhana Platform", "email": sender_email},
+            "to": [{"email": recipient_email, "name": customer_name}],
+            "subject": f"🔑 Your DataKarkhana Production Key — {plan_name} ({credits} Credits)",
+            "htmlContent": html_body
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "accept": "application/json",
+                "api-key": brevo_api_key,
+                "content-type": "application/json"
+            }
+        )
+        with urllib.request.urlopen(req) as resp:
+            if resp.status in (200, 201):
+                print(f"[LICENSE EMAIL SUCCESS] License key email sent to {recipient_email}!")
+                return True, ""
+    except Exception as ex:
+        print(f"[LICENSE EMAIL ERROR] {ex}")
+        return False, str(ex)
+
+    return False, "Unknown error sending license key email."
+
 
 def resolve_frontend_base_url(request: Optional[Request] = None) -> str:
     """Dynamically determine the frontend URL based on FRONTEND_MODE flag ('local' or 'render') or request origin"""
@@ -384,34 +484,25 @@ def resolve_frontend_base_url(request: Optional[Request] = None) -> str:
 @app.post("/api/auth/register")
 def register(req: RegisterRequest, request: Request):
     conn = get_db()
-    exists = conn.execute("SELECT id FROM users WHERE email = ?", (req.email,)).fetchone()
+    exists = conn.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (req.email.strip(),)).fetchone()
     if exists:
         conn.close()
         raise HTTPException(status_code=400, detail="An account with this email already exists.")
     
     pwd_hash = hash_password(req.password)
-    v_token = str(uuid.uuid4())
+    otp = generate_otp()
     
-    base_url = resolve_frontend_base_url(request)
-    verify_link = f"{base_url}/auth?verify_token={v_token}"
-    
-    # 1. SEND EMAIL FIRST - DO NOT INSERT TO DATABASE IF EMAIL DISPATCH FAILS!
-    email_dispatched, err_msg = send_free_verification_email(req.email, req.full_name, verify_link)
-    if not email_dispatched:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Verification email could not be sent: {err_msg}. Registration cancelled."
-        )
+    # 1. SEND OTP EMAIL
+    email_dispatched, err_msg = send_free_verification_email(req.email, req.full_name, otp)
 
-    # 2. ONLY INSERT USER INTO DATABASE WHEN VERIFICATION EMAIL IS SENT SUCCESSFULLY!
+    # 2. INSERT USER INTO DATABASE
     try:
         conn.execute(
             "INSERT INTO users (email, full_name, password_hash, role, credits, is_verified, verification_token) VALUES (?, ?, ?, 'user', 5, 0, ?)",
-            (req.email, req.full_name, pwd_hash, v_token)
+            (req.email.strip(), req.full_name.strip(), pwd_hash, otp)
         )
         conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE email = ?", (req.email,)).fetchone()
+        user = conn.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (req.email.strip(),)).fetchone()
     except Exception as db_err:
         conn.close()
         print(f"[REGISTRATION DB ERROR] {db_err}")
@@ -424,9 +515,69 @@ def register(req: RegisterRequest, request: Request):
     return {
         "success": True,
         "requires_verification": True,
-        "email_dispatched": True,
-        "message": f"Verification email successfully sent to {req.email}! Please check your inbox and click the verification link.",
+        "email_dispatched": email_dispatched,
+        "message": f"A 6-digit verification code has been sent to {req.email}! Please enter it below to activate your account.",
         "email": user["email"] if user else req.email
+    }
+
+class VerifyOtpRequest(BaseModel):
+    email: str
+    otp: str
+
+@app.post("/api/auth/verify-otp")
+def verify_otp(req: VerifyOtpRequest):
+    """Verifies a user account using a 6-digit OTP code and logs the user in immediately."""
+    conn = get_db()
+    user_row = conn.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (req.email.strip(),)).fetchone()
+    if not user_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No account found with this email.")
+
+    user = dict(user_row)
+    if user["is_verified"] == 1:
+        conn.close()
+        token = create_jwt_token(user["id"], user["role"])
+        return {
+            "success": True,
+            "already_verified": True,
+            "message": "Account email is already verified.",
+            "token": token,
+            "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "full_name": user["full_name"],
+                "role": user["role"],
+                "credits": user["credits"],
+                "is_verified": 1,
+                "warning_message": user.get("warning_message") or ""
+            }
+        }
+
+    expected_otp = (user.get("verification_token") or "").strip()
+    provided_otp = req.otp.strip()
+
+    if not expected_otp or expected_otp != provided_otp:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code. Please check your email and try again.")
+
+    conn.execute("UPDATE users SET is_verified = 1, verification_token = NULL WHERE id = ?", (user["id"],))
+    conn.commit()
+    conn.close()
+
+    token = create_jwt_token(user["id"], user["role"])
+    return {
+        "success": True,
+        "message": "Email verified successfully! Welcome to DataKarkhana.",
+        "token": token,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "credits": user["credits"],
+            "is_verified": 1,
+            "warning_message": user.get("warning_message") or ""
+        }
     }
 
 @app.get("/api/auth/verify-email")
@@ -434,7 +585,7 @@ def verify_email(token: str):
     if not token or not token.strip():
         return {
             "success": False,
-            "message": "Verification token is missing."
+            "message": "Verification code or token is missing."
         }
     
     conn = get_db()
@@ -444,7 +595,7 @@ def verify_email(token: str):
         return {
             "success": False,
             "already_verified": True,
-            "message": "This verification link is invalid or has already been used. If you already verified your email, please log in to access your account."
+            "message": "This verification code is invalid or has already been used. Please log in to access your account."
         }
     
     conn.execute("UPDATE users SET is_verified = 1, verification_token = NULL WHERE id = ?", (user["id"],))
@@ -459,7 +610,7 @@ def verify_email(token: str):
 @app.post("/api/auth/resend-verification")
 def resend_verification(req: ResendVerificationRequest, request: Request):
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE email = ?", (req.email,)).fetchone()
+    user = conn.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (req.email.strip(),)).fetchone()
     if not user:
         conn.close()
         raise HTTPException(status_code=404, detail="No account found with this email.")
@@ -468,40 +619,76 @@ def resend_verification(req: ResendVerificationRequest, request: Request):
         conn.close()
         return {"success": True, "message": "Account email is already verified. Please proceed to login."}
     
-    v_token = str(uuid.uuid4())
-    conn.execute("UPDATE users SET verification_token = ? WHERE id = ?", (v_token, user["id"]))
+    otp = generate_otp()
+    conn.execute("UPDATE users SET verification_token = ? WHERE id = ?", (otp, user["id"]))
     conn.commit()
     conn.close()
     
-    base_url = resolve_frontend_base_url(request)
-    verify_link = f"{base_url}/auth?verify_token={v_token}"
-    email_dispatched, err_msg = send_free_verification_email(req.email, user["full_name"], verify_link)
-    if not email_dispatched:
-        raise HTTPException(status_code=400, detail=f"Failed to resend email: {err_msg}")
+    email_dispatched, err_msg = send_free_verification_email(req.email.strip(), user["full_name"], otp)
 
     return {
         "success": True,
-        "email_dispatched": True,
-        "message": "A new verification link has been sent to your email address."
+        "email_dispatched": email_dispatched,
+        "message": f"A new 6-digit verification code has been sent to {req.email}."
     }
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
     conn = get_db()
     user_row = conn.execute("SELECT * FROM users WHERE email = ?", (req.email,)).fetchone()
-    conn.close()
     
     if not user_row or not verify_password(req.password, user_row["password_hash"]):
+        conn.close()
         raise HTTPException(status_code=400, detail="Invalid email or password.")
     
     user = dict(user_row)
     
     # Require email verification for non-admin users
     if user["role"] not in ("admin", "superadmin") and user.get("is_verified", 0) != 1:
+        conn.close()
         raise HTTPException(
             status_code=400,
             detail="Email address not verified! Please check your email inbox for the verification link before logging in."
         )
+
+    # Check license expiration for non-admin users
+    if user["role"] not in ("admin", "superadmin"):
+        lic_row = conn.execute(
+            """SELECT * FROM licenses 
+               WHERE user_id = ? OR LOWER(customer_email) = ? 
+               ORDER BY expires_at DESC LIMIT 1""",
+            (user["id"], user["email"].strip().lower())
+        ).fetchone()
+
+        if lic_row:
+            lic_dict = dict(lic_row)
+            if lic_dict.get("status") == "revoked":
+                conn.close()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Your license has been revoked by the system administrator. Please contact support."
+                )
+
+            exp_val = lic_dict.get("expires_at")
+            if exp_val:
+                now = datetime.now(timezone.utc)
+                if isinstance(exp_val, datetime):
+                    exp_dt = exp_val if exp_val.tzinfo else exp_val.replace(tzinfo=timezone.utc)
+                else:
+                    exp_str = str(exp_val)
+                    if "T" in exp_str:
+                        exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    else:
+                        exp_dt = datetime.strptime(exp_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+                if now > exp_dt:
+                    conn.close()
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"License Expired: Your license expired on {exp_dt.strftime('%B %d, %Y')}. You cannot log in until your license is renewed. Please contact your administrator."
+                    )
+
+    conn.close()
     
     token = create_jwt_token(user["id"], user["role"])
     return {
@@ -1359,7 +1546,12 @@ def update_dataset_request_status(request_id: int, req: DatasetRequestStatusUpda
     return {"success": True, "message": f"Dataset request status updated to '{req.status}'!"}
 
 @app.post("/api/scraper/scrape")
-def trigger_scrape(req: ScrapeRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+def trigger_scrape(
+    req: ScrapeRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    _license_valid: bool = Depends(check_desktop_license)
+):
     query_list = []
     if req.queries and isinstance(req.queries, list):
         query_list = [q.strip() for q in req.queries if q and q.strip()]
@@ -1772,8 +1964,17 @@ def list_admin_payment_requests(admin_user: dict = Depends(get_admin_user)):
     conn.close()
     return [dict(r) for r in rows]
 
+class ApprovePaymentPayload(BaseModel):
+    expiry_days: Optional[int] = 30
+    expires_at: Optional[str] = None
+    custom_key: Optional[str] = None
+
 @app.post("/api/admin/payment-requests/{request_id}/approve")
-def approve_payment_request(request_id: int, admin_user: dict = Depends(get_admin_user)):
+def approve_payment_request(
+    request_id: int,
+    payload: Optional[ApprovePaymentPayload] = None,
+    admin_user: dict = Depends(get_admin_user)
+):
     conn = get_db()
     req = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
     if not req:
@@ -1784,26 +1985,70 @@ def approve_payment_request(request_id: int, admin_user: dict = Depends(get_admi
         conn.close()
         raise HTTPException(status_code=400, detail=f"Payment request has already been {req['status']}.")
 
-    # Add credits to user
-    conn.execute("UPDATE users SET credits = credits + ? WHERE id = ?", (req["credits_requested"], req["user_id"]))
+    # Fetch user info
+    user_row = conn.execute("SELECT email, full_name FROM users WHERE id = ?", (req["user_id"],)).fetchone()
+    customer_email = user_row["email"] if user_row else ""
+    customer_name = (user_row["full_name"] if user_row else "") or req.get("user_name") or "Customer"
 
-    # Log credit transaction
-    conn.execute(
-        """INSERT INTO credit_transactions (user_id, amount, transaction_type, description)
-           VALUES (?, ?, 'add', ?)""",
-        (req["user_id"], req["credits_requested"], f"bKash Package Purchase: {req['package_name']} (TrxID: {req['transaction_id']})")
+    # NOTE: Credits are NO LONGER added here. They are deferred until the
+    # customer activates the license key in the Subscribe panel.
+    # This ensures the Super Admin has full control — the key acts as a
+    # redeemable token that grants credits on first activation.
+
+    credits_amount = req["credits_requested"]
+    plan_name = req["package_name"] or "Pro"
+
+    # Generate Desktop Production License Key (with embedded credits_amount)
+    expiry_days = (payload.expiry_days if payload and payload.expiry_days else 30)
+    expires_at_val = (payload.expires_at if payload else None)
+    custom_key_val = (payload.custom_key if payload else None)
+
+    license_info = generate_production_license(
+        customer_name=customer_name,
+        customer_email=customer_email,
+        expiry_days=expiry_days,
+        expires_at_str=expires_at_val,
+        user_id=req["user_id"],
+        payment_request_id=request_id,
+        custom_key=custom_key_val,
+        plan_tier=plan_name.lower(),
+        credits_amount=credits_amount
     )
 
-    # Update payment request status
     import datetime
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
-        "UPDATE payment_requests SET status = 'approved', processed_at = ?, processed_by = ? WHERE id = ?",
-        (now_str, admin_user["id"], request_id)
+        """UPDATE payment_requests 
+           SET status = 'approved', processed_at = ?, processed_by = ?, production_key = ?, license_expiry = ?
+           WHERE id = ?""",
+        (now_str, admin_user["id"], license_info["production_key"], license_info["expires_at"], request_id)
     )
     conn.commit()
     conn.close()
-    return {"success": True, "message": f"Payment approved! Successfully added {req['credits_requested']} credits to user account."}
+
+    # Send the license key to the customer via email (async, non-blocking)
+    email_sent = False
+    if customer_email:
+        try:
+            email_sent_result, email_error = send_license_key_email(
+                recipient_email=customer_email,
+                customer_name=customer_name,
+                production_key=license_info["production_key"],
+                plan_name=plan_name,
+                credits=credits_amount,
+                expires_at=license_info["expires_at"]
+            )
+            email_sent = email_sent_result
+        except Exception as e:
+            print(f"[LICENSE EMAIL ERROR] {e}")
+
+    return {
+        "success": True,
+        "message": f"Payment approved! Production key generated for {customer_name}." + (" License key emailed." if email_sent else " (Email not sent — key shown below.)"),
+        "credits_pending": credits_amount,
+        "email_sent": email_sent,
+        "license": license_info
+    }
 
 @app.post("/api/admin/payment-requests/{request_id}/reject")
 def reject_payment_request(request_id: int, rejection_reason: str = Form("Transaction ID mismatch or invalid payment"), admin_user: dict = Depends(get_admin_user)):
@@ -1822,6 +2067,396 @@ def reject_payment_request(request_id: int, rejection_reason: str = Form("Transa
     conn.commit()
     conn.close()
     return {"success": True, "message": "Payment request rejected."}
+
+# ── Desktop Production License & Admin Key Management Endpoints ──
+
+@app.get("/api/admin/licenses")
+def list_admin_licenses(admin_user: dict = Depends(get_admin_user)):
+    """Admin endpoint: lists all issued production keys and expiration dates"""
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT l.*, u.email as user_email_ref
+        FROM licenses l
+        LEFT JOIN users u ON l.user_id = u.id
+        ORDER BY l.created_at DESC
+    """).fetchall()
+    conn.close()
+
+    results = []
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        d = dict(r)
+        exp_str = d.get("expires_at")
+        days_left = 0
+        is_exp = False
+        if exp_str:
+            try:
+                if "T" in str(exp_str):
+                    exp_dt = datetime.fromisoformat(str(exp_str).replace("Z", "+00:00"))
+                else:
+                    exp_dt = datetime.strptime(str(exp_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                days_left = max(0, (exp_dt - now).days)
+                is_exp = now > exp_dt
+            except Exception:
+                pass
+        d["days_remaining"] = days_left
+        d["is_expired"] = is_exp
+        results.append(d)
+    return results
+
+class AdminGenerateLicensePayload(BaseModel):
+    customer_name: str
+    customer_email: Optional[str] = ""
+    expiry_days: Optional[int] = 30
+    expires_at: Optional[str] = None
+    custom_key: Optional[str] = None
+    plan_tier: Optional[str] = "pro"
+    credits_amount: Optional[int] = 0
+
+@app.post("/api/admin/licenses/generate")
+def admin_generate_license(payload: AdminGenerateLicensePayload, admin_user: dict = Depends(get_admin_user)):
+    """Admin endpoint: manually generate and sign a new production license key with optional user linking and credits"""
+    user_id = None
+    cust_email = (payload.customer_email or "").strip()
+    if cust_email:
+        conn = get_db()
+        matched_user = conn.execute(
+            "SELECT id, full_name FROM users WHERE LOWER(email) = LOWER(?)",
+            (cust_email,)
+        ).fetchone()
+        conn.close()
+        if matched_user:
+            user_id = matched_user["id"]
+
+    license_info = generate_production_license(
+        customer_name=payload.customer_name,
+        customer_email=cust_email,
+        expiry_days=payload.expiry_days or 30,
+        expires_at_str=payload.expires_at,
+        user_id=user_id,
+        custom_key=payload.custom_key,
+        plan_tier=payload.plan_tier or "pro",
+        credits_amount=payload.credits_amount or 0
+    )
+    return {"success": True, "license": license_info}
+
+class AdminExtendLicensePayload(BaseModel):
+    additional_days: int = 30
+
+@app.post("/api/admin/licenses/{license_id}/extend")
+def admin_extend_license(license_id: int, payload: AdminExtendLicensePayload, admin_user: dict = Depends(get_admin_user)):
+    """Admin endpoint: extend an existing license's expiration date"""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM licenses WHERE id = ?", (license_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="License not found.")
+
+    now = datetime.now(timezone.utc)
+    current_exp_str = row["expires_at"]
+    try:
+        if "T" in str(current_exp_str):
+            base_dt = datetime.fromisoformat(str(current_exp_str).replace("Z", "+00:00"))
+        else:
+            base_dt = datetime.strptime(str(current_exp_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        if base_dt < now:
+            base_dt = now
+    except Exception:
+        base_dt = now
+
+    new_exp_dt = base_dt + timedelta(days=payload.additional_days)
+    new_exp_str = new_exp_dt.strftime("%Y-%m-%dT23:59:59Z")
+
+    updated_license = generate_production_license(
+        customer_name=row["customer_name"],
+        customer_email=row["customer_email"],
+        expires_at_str=new_exp_str,
+        user_id=row["user_id"],
+        payment_request_id=row["payment_request_id"],
+        custom_key=row["production_key"],
+        plan_tier=row["plan_tier"],
+        credits_amount=row["credits_amount"] or 0
+    )
+
+    conn.execute(
+        "UPDATE licenses SET expires_at = ?, license_token = ?, status = 'active' WHERE id = ?",
+        (new_exp_str, updated_license["license_token"], license_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"success": True, "message": f"License extended by {payload.additional_days} days.", "license": updated_license}
+
+@app.post("/api/admin/licenses/{license_id}/revoke")
+def admin_revoke_license(license_id: int, admin_user: dict = Depends(get_admin_user)):
+    """Admin endpoint: revoke an active license"""
+    conn = get_db()
+    conn.execute("UPDATE licenses SET status = 'revoked' WHERE id = ?", (license_id,))
+    conn.commit()
+    conn.close()
+    return {"success": True, "message": "License revoked successfully."}
+
+# ── Client-facing Desktop License Status & Activation Endpoints ──
+
+@app.get("/api/license/status")
+def get_license_status_endpoint(current_user: Optional[dict] = Depends(get_optional_current_user)):
+    """Client endpoint: returns current desktop app license status dynamically for the calling user"""
+    return get_current_license_status(current_user)
+
+class ActivateLicensePayload(BaseModel):
+    license_key: str
+
+@app.post("/api/license/activate")
+def activate_license_endpoint(payload: ActivateLicensePayload, current_user: dict = Depends(get_current_user)):
+    """Client endpoint: activates desktop app using production key or full token.
+    On activation of an unredeemed key, binds it to the current user and grants credits."""
+    raw_key = payload.license_key.strip()
+    if not raw_key:
+        raise HTTPException(status_code=400, detail="License key cannot be empty.")
+
+    conn = get_db()
+    lic_row = conn.execute(
+        "SELECT * FROM licenses WHERE production_key = ? OR license_token = ? ORDER BY id DESC LIMIT 1",
+        (raw_key, raw_key)
+    ).fetchone()
+
+    # If not found directly, verify signed token
+    if not lic_row and "." in raw_key:
+        token_res = verify_license(raw_key)
+        if token_res.get("valid"):
+            prod_k = token_res.get("production_key")
+            if prod_k:
+                lic_row = conn.execute(
+                    "SELECT * FROM licenses WHERE production_key = ? ORDER BY id DESC LIMIT 1",
+                    (prod_k,)
+                ).fetchone()
+
+    if not lic_row:
+        token_res = verify_license(raw_key)
+        if not token_res.get("valid"):
+            conn.close()
+            raise HTTPException(status_code=400, detail=token_res.get("message", "Invalid license key."))
+        # Insert standalone verified key
+        exp_iso = token_res.get("expires_at")
+        conn.execute("""
+            INSERT INTO licenses (user_id, customer_name, customer_email, production_key, license_token, plan_tier, credits_amount, is_redeemed, status, expires_at, last_validated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 1, 'active', ?, CURRENT_TIMESTAMP)
+        """, (
+            current_user["id"],
+            current_user["full_name"],
+            current_user["email"],
+            token_res.get("production_key") or raw_key,
+            token_res.get("license_token") or raw_key,
+            token_res.get("plan_tier") or "pro",
+            exp_iso
+        ))
+        conn.commit()
+        lic_row = conn.execute("SELECT * FROM licenses WHERE production_key = ?", (token_res.get("production_key") or raw_key,)).fetchone()
+
+    lic_dict = dict(lic_row)
+
+    if lic_dict.get("status") == "revoked":
+        conn.close()
+        raise HTTPException(status_code=400, detail="This license has been revoked.")
+
+    exp_val = lic_dict.get("expires_at")
+    now = datetime.now(timezone.utc)
+    if isinstance(exp_val, datetime):
+        exp_dt = exp_val if exp_val.tzinfo else exp_val.replace(tzinfo=timezone.utc)
+    else:
+        exp_str = str(exp_val)
+        if "T" in exp_str:
+            exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+        else:
+            exp_dt = datetime.strptime(exp_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+    if now > exp_dt:
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"This license key expired on {exp_dt.strftime('%B %d, %Y')}.")
+
+    # If assigned to another user's email or user_id
+    if lic_dict.get("user_id") and lic_dict.get("user_id") != current_user["id"]:
+        if lic_dict.get("customer_email") and lic_dict.get("customer_email").strip().lower() != current_user["email"].strip().lower():
+            conn.close()
+            raise HTTPException(status_code=400, detail="This license key is assigned to a different user account.")
+
+    credits_granted = 0
+    new_balance = current_user.get("credits", 0)
+
+    if not lic_dict.get("is_redeemed"):
+        credits_to_add = lic_dict.get("credits_amount") or 0
+        if credits_to_add > 0:
+            conn.execute("UPDATE users SET credits = credits + ? WHERE id = ?", (credits_to_add, current_user["id"]))
+            conn.execute(
+                """INSERT INTO credit_transactions (user_id, amount, transaction_type, description)
+                   VALUES (?, ?, 'add', ?)""",
+                (current_user["id"], credits_to_add, f"License Key Activation: {lic_dict.get('production_key')}")
+            )
+            credits_granted = credits_to_add
+
+        conn.execute("""
+            UPDATE licenses 
+            SET user_id = ?, customer_email = ?, is_redeemed = 1, status = 'active', last_validated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (current_user["id"], current_user["email"], lic_dict["id"]))
+        conn.commit()
+
+        u_row = conn.execute("SELECT credits FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+        if u_row:
+            new_balance = u_row["credits"]
+    else:
+        # Already redeemed: ensure linked to current user
+        if not lic_dict.get("user_id"):
+            conn.execute("UPDATE licenses SET user_id = ?, customer_email = ? WHERE id = ?", (current_user["id"], current_user["email"], lic_dict["id"]))
+            conn.commit()
+
+    conn.close()
+
+    days_remaining = max(0, (exp_dt - now).days)
+    status_data = {
+        "valid": True,
+        "is_expired": False,
+        "status": "active",
+        "production_key": lic_dict.get("production_key"),
+        "license_token": lic_dict.get("license_token"),
+        "customer_name": current_user.get("full_name"),
+        "customer_email": current_user.get("email"),
+        "plan_tier": lic_dict.get("plan_tier") or "pro",
+        "expires_at": exp_dt.isoformat(),
+        "days_remaining": days_remaining,
+        "credits_amount": lic_dict.get("credits_amount", 0),
+        "is_redeemed": True,
+        "message": f"License active. Valid until {exp_dt.strftime('%B %d, %Y')} ({days_remaining} days remaining)."
+    }
+
+    msg = f"License successfully activated! Valid until {exp_dt.strftime('%B %d, %Y')}."
+    if credits_granted > 0:
+        msg = f"License activated! {credits_granted} credits added to your account (Balance: {new_balance})."
+
+    return {
+        "success": True,
+        "message": msg,
+        "license": status_data,
+        "credits_granted": credits_granted,
+        "new_balance": new_balance
+    }
+
+class QuickRenewPayload(BaseModel):
+    email: str
+    password: str
+    license_key: str
+
+@app.post("/api/license/quick-renew")
+def quick_renew_license(payload: QuickRenewPayload):
+    """Allows an expired user to activate a new renewal key directly from the login page."""
+    conn = get_db()
+    user_row = conn.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (payload.email.strip(),)).fetchone()
+    if not user_row or not verify_password(payload.password, user_row["password_hash"]):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid email or password.")
+
+    user = dict(user_row)
+    raw_key = payload.license_key.strip()
+    lic_row = conn.execute(
+        "SELECT * FROM licenses WHERE production_key = ? OR license_token = ? ORDER BY id DESC LIMIT 1",
+        (raw_key, raw_key)
+    ).fetchone()
+
+    if not lic_row:
+        conn.close()
+        raise HTTPException(status_code=400, detail="License key not found.")
+
+    lic_dict = dict(lic_row)
+    if lic_dict.get("status") == "revoked":
+        conn.close()
+        raise HTTPException(status_code=400, detail="This license has been revoked.")
+
+    exp_val = lic_dict.get("expires_at")
+    now = datetime.now(timezone.utc)
+    if isinstance(exp_val, datetime):
+        exp_dt = exp_val if exp_val.tzinfo else exp_val.replace(tzinfo=timezone.utc)
+    else:
+        exp_str = str(exp_val)
+        if "T" in exp_str:
+            exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+        else:
+            exp_dt = datetime.strptime(exp_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+    if now > exp_dt:
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"This renewal key expired on {exp_dt.strftime('%B %d, %Y')}.")
+
+    credits_to_add = lic_dict.get("credits_amount") or 0
+    if not lic_dict.get("is_redeemed") and credits_to_add > 0:
+        conn.execute("UPDATE users SET credits = credits + ? WHERE id = ?", (credits_to_add, user["id"]))
+        conn.execute(
+            """INSERT INTO credit_transactions (user_id, amount, transaction_type, description)
+               VALUES (?, ?, 'add', ?)""",
+            (user["id"], credits_to_add, f"Renewal Key Activation: {lic_dict.get('production_key')}")
+        )
+
+    conn.execute("""
+        UPDATE licenses 
+        SET user_id = ?, customer_email = ?, is_redeemed = 1, status = 'active', last_validated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (user["id"], user["email"], lic_dict["id"]))
+    conn.commit()
+
+    token = create_jwt_token(user["id"], user["role"])
+    conn.close()
+
+    return {
+        "success": True,
+        "message": f"License renewed successfully! Valid until {exp_dt.strftime('%B %d, %Y')}.",
+        "token": token,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "credits": user["credits"] + (credits_to_add if not lic_dict.get("is_redeemed") else 0),
+            "is_verified": user.get("is_verified", 1),
+            "warning_message": user.get("warning_message") or ""
+        }
+    }
+
+
+
+
+@app.get("/api/license/my-licenses")
+def get_my_licenses(current_user: dict = Depends(get_current_user)):
+    """Client endpoint: returns all licenses associated with the current user (by user_id or email).
+    Allows the customer to see their generated keys, status, and whether credits have been redeemed."""
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT * FROM licenses
+        WHERE user_id = ? OR customer_email = ?
+        ORDER BY created_at DESC
+    """, (current_user["id"], current_user["email"])).fetchall()
+    conn.close()
+
+    now = datetime.now(timezone.utc)
+    results = []
+    for r in rows:
+        d = dict(r)
+        exp_str = d.get("expires_at")
+        days_left = 0
+        is_exp = False
+        if exp_str:
+            try:
+                if "T" in str(exp_str):
+                    exp_dt = datetime.fromisoformat(str(exp_str).replace("Z", "+00:00"))
+                else:
+                    exp_dt = datetime.strptime(str(exp_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                days_left = max(0, (exp_dt - now).days)
+                is_exp = now > exp_dt
+            except Exception:
+                pass
+        d["days_remaining"] = days_left
+        d["is_expired"] = is_exp
+        d["is_redeemed"] = bool(d.get("is_redeemed"))
+        results.append(d)
+
+    return results
 
 # ── Marketing Campaign Endpoints ─────────────────────────
 

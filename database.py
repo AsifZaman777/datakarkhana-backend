@@ -2,6 +2,7 @@ import os
 import re
 import time
 import gc
+import sqlite3
 import contextvars
 import psycopg2
 import psycopg2.pool
@@ -12,7 +13,7 @@ from auth import hash_password
 TABLES_WITH_AUTO_ID = {
     "users", "datasets", "scrape_jobs", "access_logs", "credit_transactions",
     "scrape_logs", "campaign_logs", "dataset_requests", "security_violations",
-    "payment_requests", "brevo_applications"
+    "payment_requests", "brevo_applications", "licenses"
 }
 
 _INSERT_TABLE_RE = re.compile(r"^\s*INSERT\s+INTO\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
@@ -232,6 +233,85 @@ class PostgresConnectionWrapper:
         except Exception:
             pass
 
+class SqliteCursorWrapper:
+    def __init__(self, raw_cursor):
+        self._cursor = raw_cursor
+
+    def execute(self, query, params=None):
+        if params is not None:
+            if isinstance(params, (list, tuple)):
+                clean_params = tuple(int(p) if isinstance(p, bool) else p for p in params)
+            elif isinstance(params, dict):
+                clean_params = {k: int(v) if isinstance(v, bool) else v for k, v in params.items()}
+            else:
+                clean_params = (int(params) if isinstance(params, bool) else params,)
+            return self._cursor.execute(query, clean_params)
+        return self._cursor.execute(query)
+
+    def executemany(self, query, seq_of_params):
+        return self._cursor.executemany(query, seq_of_params)
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def fetchmany(self, size=None):
+        if size is not None:
+            return self._cursor.fetchmany(size)
+        return self._cursor.fetchmany()
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def close(self):
+        return self._cursor.close()
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+class SqliteConnectionWrapper:
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+        self._conn.row_factory = sqlite3.Row
+
+    def cursor(self):
+        return SqliteCursorWrapper(self._conn.cursor())
+
+    def execute(self, query, params=None):
+        cur = self.cursor()
+        cur.execute(query, params)
+        return cur
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.rollback()
+        else:
+            self.commit()
+        self.close()
+
 # ── Connection Pool Management ─────────────────────────────────
 _db_pool = None
 _request_db_conns = contextvars.ContextVar("_request_db_conns", default=None)
@@ -241,15 +321,22 @@ def get_pool():
     if _db_pool is None or _db_pool.closed:
         url = get_clean_database_url()
         if not url:
-            raise RuntimeError(
-                "DATABASE_URL is not set in backend/.env. "
-                "Please configure your Supabase PostgreSQL connection string, e.g.:\n"
-                "DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres"
-            )
+            return None
         _db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=5, maxconn=80, dsn=url)
     return _db_pool
 
 def get_db():
+    url = get_clean_database_url()
+    # If no Postgres URL configured or local SQLite requested, use zero-config SQLite
+    if not url or url.startswith("sqlite"):
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datakarkhana_local.db")
+        raw_conn = sqlite3.connect(db_path, check_same_thread=False)
+        wrapper = SqliteConnectionWrapper(raw_conn)
+        active_conns = _request_db_conns.get()
+        if active_conns is not None:
+            active_conns.append(wrapper)
+        return wrapper
+
     pool = get_pool()
     raw_conn = None
     max_retries = 20
@@ -262,11 +349,9 @@ def get_db():
                 continue
             break
         except psycopg2.pool.PoolError:
-            # Pool momentarily saturated: force GC to clean dropped wrappers and retry
             gc.collect()
             time.sleep(0.02)
             if attempt == max_retries - 1:
-                # Fallback: create standalone direct connection instead of raising PoolError
                 try:
                     raw_conn = psycopg2.connect(get_clean_database_url())
                     wrapper = PostgresConnectionWrapper(raw_conn, None)
@@ -300,7 +385,6 @@ def get_db():
 
     wrapper = PostgresConnectionWrapper(raw_conn, pool)
 
-    # Automatically track with current HTTP request context if inside a web request
     active_conns = _request_db_conns.get()
     if active_conns is not None:
         active_conns.append(wrapper)
@@ -538,6 +622,46 @@ def init_db():
         );
     """)
 
+    # 16. Desktop Production Licenses table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            customer_name TEXT,
+            customer_email TEXT,
+            payment_request_id INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL,
+            production_key TEXT UNIQUE NOT NULL,
+            license_token TEXT NOT NULL,
+            plan_tier TEXT DEFAULT 'pro',
+            credits_amount INTEGER DEFAULT 0,
+            is_redeemed INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active' CHECK(status IN ('active', 'expired', 'revoked')),
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_validated_at TIMESTAMP
+        );
+    """)
+
+    # Migrations for payment_requests (add production_key & license_expiry)
+    try:
+        cursor.execute("ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS production_key TEXT;")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS license_expiry TIMESTAMP;")
+    except Exception:
+        pass
+
+    # Migrations for licenses (add credits_amount & is_redeemed for deferred credit activation)
+    try:
+        cursor.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS credits_amount INTEGER DEFAULT 0;")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_redeemed INTEGER DEFAULT 0;")
+    except Exception:
+        pass
+
     # Seed or ensure Superadmin user exists
     try:
         pwd_hash = hash_password(SUPERADMIN_PASSWORD)
@@ -569,15 +693,6 @@ def init_db():
 
     conn.commit()
     conn.close()
-
-    # Clean up local SQLite db if present
-    local_db_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "databazaar.db")
-    if os.path.exists(local_db_file):
-        try:
-            os.remove(local_db_file)
-            print("[OK] Removed local databazaar.db file.")
-        except Exception as e:
-            print("[WARNING] Could not remove local databazaar.db:", e)
 
     print("[OK] Supabase PostgreSQL database schema initialized successfully.")
 
