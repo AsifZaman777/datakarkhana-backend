@@ -509,16 +509,17 @@ def download_desktop_app(os_name: str = Query("windows", alias="os")):
     if clean_os in ("win", "windows"):
         candidates = [
             os.path.join(dist_dir, "DataKarkhana Desktop Setup 2.0.0.exe"),
+            os.path.join(dist_dir, "DataKarkhana Desktop 2.0.0.exe"),
             os.path.join(dist_dir, "DataKarkhana Desktop Setup.exe"),
-            os.path.join(dist_dir, "win-unpacked", "DataKarkhana Desktop.exe"),
         ]
-        filename = "DataKarkhana_Desktop_Setup_v2.exe"
+        filename = "DataKarkhana_Desktop_Setup_v2.0.0.exe"
     else:
         candidates = [
             os.path.join(dist_dir, "DataKarkhana Desktop-2.0.0-arm64.dmg"),
+            os.path.join(dist_dir, "DataKarkhana Desktop-2.0.0-arm64-mac.zip"),
             os.path.join(dist_dir, "DataKarkhana Desktop-2.0.0.dmg"),
         ]
-        filename = "DataKarkhana_Desktop_Mac_v2.dmg"
+        filename = "DataKarkhana_Desktop_Mac_v2.0.0.dmg"
 
     for candidate in candidates:
         if os.path.exists(candidate):
