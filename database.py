@@ -316,6 +316,15 @@ class SqliteConnectionWrapper:
 _db_pool = None
 _request_db_conns = contextvars.ContextVar("_request_db_conns", default=None)
 
+def reset_pool():
+    global _db_pool
+    if _db_pool is not None:
+        try:
+            _db_pool.closeall()
+        except Exception:
+            pass
+        _db_pool = None
+
 def get_pool():
     global _db_pool
     if _db_pool is None or _db_pool.closed:
@@ -347,6 +356,22 @@ def get_db():
                 pool.putconn(raw_conn, close=True)
                 raw_conn = None
                 continue
+
+            # Quick ping to verify socket connection is still alive (reconnects after overnight timeout)
+            try:
+                with raw_conn.cursor() as test_cur:
+                    test_cur.execute("SELECT 1;")
+            except Exception:
+                try:
+                    pool.putconn(raw_conn, close=True)
+                except Exception:
+                    pass
+                raw_conn = None
+                if attempt >= 3:
+                    reset_pool()
+                    pool = get_pool()
+                continue
+
             break
         except psycopg2.pool.PoolError:
             gc.collect()
@@ -368,8 +393,9 @@ def get_db():
                 except Exception:
                     pass
                 raw_conn = None
-            if attempt >= 2:
-                raise
+            if attempt >= 5:
+                reset_pool()
+                pool = get_pool()
             time.sleep(0.02)
 
     if raw_conn is None:
