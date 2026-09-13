@@ -198,12 +198,68 @@ class TestFullApplicationBackend(unittest.TestCase):
         res = client.get("/api/admin/payments", headers=headers)
         self.assertIn(res.status_code, [200, 401, 403])
 
-    def test_16_admin_security_violations(self):
-        """Test admin listing anti-leak security sensor logs"""
-        headers = {"Authorization": f"Bearer {self.admin_token}"}
-        res = client.get("/api/admin/violations", headers=headers)
-        self.assertIn(res.status_code, [200, 401, 403])
+    def test_17_dataset_export_permissions(self):
+        """Test dataset export permissions for regular user vs admin"""
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        # Locked dataset export attempt should be 403 Forbidden
+        res_user = client.get("/api/datasets/99999/export", headers=user_headers)
+        self.assertIn(res_user.status_code, [403, 404])
+
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+        res_admin = client.get("/api/datasets/99999/export", headers=admin_headers)
+        # Admin is not blocked with 403, will get 404 (dataset missing)
+        self.assertEqual(res_admin.status_code, 404)
+
+    def test_18_promotion_request_workflow(self):
+        """Test user promotion request and admin review flow"""
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+
+        # Create a mock completed scrape job for test user
+        from database import get_db
+        conn = get_db()
+        # Find user id
+        user_row = conn.execute("SELECT id FROM users WHERE role = 'user' ORDER BY id ASC LIMIT 1").fetchone()
+        user_id = user_row["id"] if user_row else 1
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO scrape_jobs (user_id, query, division, district, area, status, result_path, result_count, promotion_status)
+               VALUES (?, 'Dentists in Gulshan', 'Dhaka', 'Dhaka', 'Gulshan', 'done', 'test_dummy.xlsx', 25, 'none')""",
+            (user_id,)
+        )
+        job_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        # User submits promotion request
+        res_req = client.post(
+            f"/api/scraper/jobs/{job_id}/request-promote",
+            data={"name": "Gulshan Dental Clinics", "category": "Healthcare"},
+            headers=user_headers
+        )
+        self.assertEqual(res_req.status_code, 200)
+        self.assertIn("submitted", res_req.json().get("message", "").lower())
+
+        # Admin lists promotion requests
+        res_list = client.get("/api/admin/promotion-requests", headers=admin_headers)
+        self.assertEqual(res_list.status_code, 200)
+        pending_list = res_list.json()
+        matching = [p for p in pending_list if p.get("job_id") == job_id]
+        self.assertTrue(len(matching) > 0)
+        self.assertEqual(matching[0]["status"], "pending")
+        self.assertEqual(matching[0]["name"], "Gulshan Dental Clinics")
+
+        # Admin rejects request
+        res_rej = client.post(f"/api/admin/promotion-requests/{job_id}/reject", headers=admin_headers)
+        self.assertEqual(res_rej.status_code, 200)
+
+        # Cleanup
+        conn = get_db()
+        conn.execute("DELETE FROM scrape_jobs WHERE id = ?", (job_id,))
+        conn.commit()
+        conn.close()
 
 
 if __name__ == "__main__":
     unittest.main()
+

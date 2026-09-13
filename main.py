@@ -871,9 +871,9 @@ def publish_dataset_to_public(dataset_id: int, current_user: dict = Depends(get_
         conn.close()
         raise HTTPException(status_code=404, detail="Dataset not found.")
 
-    if current_user["role"] not in ("admin", "superadmin") and ds["uploaded_by"] != current_user["id"]:
+    if current_user["role"] not in ("admin", "superadmin"):
         conn.close()
-        raise HTTPException(status_code=403, detail="You do not have permission to publish this dataset.")
+        raise HTTPException(status_code=403, detail="Only administrators can publish datasets to the public catalogue.")
 
     conn.execute("UPDATE datasets SET is_active = 1 WHERE id = ?", (dataset_id,))
     conn.commit()
@@ -1074,7 +1074,7 @@ def get_dataset(dataset_id: str, page: int = 1, limit: int = 25, search: Optiona
                 "SELECT id FROM access_logs WHERE user_id = ? AND dataset_id = ? AND action = 'unlock'",
                 (current_user_id, dataset_id)
             ).fetchone()
-            if log or role in ("admin", "superadmin"):
+            if log or role in ("admin", "superadmin") or (current_user_id and ds["uploaded_by"] == current_user_id):
                 unlocked = True
 
     # Apply search filter
@@ -1273,30 +1273,55 @@ def generate_export_response(file_path: str, export_format: str, title: str = "E
 @app.get("/api/datasets/{dataset_id}/export")
 def export_dataset(dataset_id: str, request: Request, format: Optional[str] = "excel", token: Optional[str] = None, authorization: Optional[str] = Header(None)):
     current_user = get_current_user(request=request, authorization=authorization, token=token)
-    if current_user.get("role") not in ("admin", "superadmin"):
-        raise HTTPException(
-            status_code=403,
-            detail="Permission denied. Only Administrators can export datasets."
-        )
+    is_admin = current_user.get("role") in ("admin", "superadmin")
 
     conn = get_db()
     file_path = None
     title_name = "Exported_Dataset"
+
     if str(dataset_id).startswith("job_"):
         job_real_id = str(dataset_id).replace("job_", "")
         job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_real_id,)).fetchone()
-        if job:
-            file_path = job["result_path"]
-            title_name = job["query"] or f"Job_{job['id']}"
-            if file_path and not os.path.exists(file_path):
-                fn = os.path.basename(file_path.replace("\\", "/"))
-                if os.path.exists(os.path.join(SCRAPE_RESULTS_FOLDER, fn)):
-                    file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fn)
+        if not job:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Private scrape job dataset not found.")
+
+        if not is_admin and job["user_id"] != current_user["id"]:
+            conn.close()
+            raise HTTPException(status_code=403, detail="Permission denied. You can only export your own scrape jobs.")
+
+        file_path = job["result_path"]
+        title_name = job["query"] or f"Job_{job['id']}"
+        if file_path and not os.path.exists(file_path):
+            fn = os.path.basename(file_path.replace("\\", "/"))
+            if os.path.exists(os.path.join(SCRAPE_RESULTS_FOLDER, fn)):
+                file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fn)
     else:
         ds = conn.execute("SELECT * FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
-        if ds:
-            file_path = resolve_dataset_file_path(ds["file_path"], int(dataset_id))
-            title_name = ds["name"]
+        if not ds:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+
+        is_owner = ds["uploaded_by"] == current_user["id"]
+        has_unlocked = False
+        if not is_admin and not is_owner:
+            log = conn.execute(
+                "SELECT id FROM access_logs WHERE user_id = ? AND dataset_id = ? AND action = 'unlock'",
+                (current_user["id"], dataset_id)
+            ).fetchone()
+            if log:
+                has_unlocked = True
+
+        if not is_admin and not is_owner and not has_unlocked:
+            conn.close()
+            raise HTTPException(
+                status_code=403,
+                detail="Permission denied. You must unlock this dataset before downloading."
+            )
+
+        file_path = resolve_dataset_file_path(ds["file_path"], int(dataset_id))
+        title_name = ds["name"]
+
     conn.close()
 
     if not file_path or not os.path.exists(file_path):
@@ -1778,28 +1803,45 @@ def request_promote_job(
     job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
     if not job or not job["result_path"]:
         conn.close()
-        raise HTTPException(status_code=400, detail="Cannot add job to catalogue because result file is missing.")
+        raise HTTPException(status_code=400, detail="Cannot promote job because result file is missing.")
 
     if job["status"] not in ("done", "stopped"):
         conn.close()
-        raise HTTPException(status_code=400, detail="Job must be completed or stopped before adding to catalogue.")
+        raise HTTPException(status_code=400, detail="Job must be completed or stopped before promoting.")
 
-    if current_user["role"] != "admin" and current_user["role"] != "superadmin" and job["user_id"] != current_user["id"]:
+    is_admin = current_user["role"] in ("admin", "superadmin")
+    if not is_admin and job["user_id"] != current_user["id"]:
         conn.close()
         raise HTTPException(status_code=403, detail="You do not have permission to promote this dataset.")
 
-    final_name = name or job["query"] or f"Scraped Dataset #{job_id}"
-    final_category = category or "Scraped Leads"
+    final_name = name or job["proposed_name"] or job["query"] or f"Scraped Dataset #{job_id}"
+    final_category = category or job["proposed_category"] or "Scraped Leads"
 
-    # Check if already added to datasets table
-    existing_ds = conn.execute("SELECT id FROM datasets WHERE file_path LIKE ?", (f"%promoted_{job_id}_%",)).fetchone()
-    if existing_ds:
-        conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved' WHERE id = ?", (job_id,))
+    # If the user is NOT an admin, submit a request for administrator approval
+    if not is_admin:
+        if job["promotion_status"] == "pending":
+            conn.close()
+            return {"success": True, "message": "Promotion request is already pending review by administrators."}
+        if job["promotion_status"] == "approved":
+            conn.close()
+            return {"success": True, "message": "This dataset has already been promoted to the public catalog."}
+
+        conn.execute(
+            "UPDATE scrape_jobs SET promotion_status = 'pending', proposed_name = ?, proposed_category = ? WHERE id = ?",
+            (final_name, final_category, job_id)
+        )
         conn.commit()
         conn.close()
-        return {"success": True, "dataset_id": existing_ds["id"], "message": "Dataset already present in Private Catalogue."}
+        return {"success": True, "message": "Promotion request submitted successfully! An administrator will review and publish it."}
 
-    # Add dataset directly into catalogue
+    # If user IS admin, direct promotion to public catalog:
+    existing_ds = conn.execute("SELECT id FROM datasets WHERE file_path LIKE ?", (f"%promoted_{job_id}_%",)).fetchone()
+    if existing_ds:
+        conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved', proposed_name = ?, proposed_category = ? WHERE id = ?", (final_name, final_category, job_id))
+        conn.commit()
+        conn.close()
+        return {"success": True, "dataset_id": existing_ds["id"], "message": "Dataset already present in public catalog."}
+
     new_filename = f"promoted_{job_id}_{int(time.time())}.xlsx"
     new_path = os.path.join(UPLOAD_FOLDER, new_filename)
     import shutil
@@ -1810,13 +1852,13 @@ def request_promote_job(
     cursor.execute(
         """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, uploaded_by)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, ?)""",
-        (final_name, final_category, job["division"], job["district"], job["area"], rel_path, job["result_count"], current_user["id"])
+        (final_name, final_category, job["division"], job["district"], job["area"], rel_path, job["result_count"], job["user_id"])
     )
     new_ds_id = cursor.lastrowid
     conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved', proposed_name = ?, proposed_category = ? WHERE id = ?", (final_name, final_category, job_id))
     conn.commit()
     conn.close()
-    return {"success": True, "dataset_id": new_ds_id, "message": "Scraped dataset added successfully to Private Catalogue!"}
+    return {"success": True, "dataset_id": new_ds_id, "message": f"Dataset '{final_name}' published directly to Public Catalog!"}
 
 @app.get("/api/admin/promotion-requests")
 def list_promotion_requests(admin_user: dict = Depends(get_admin_user)):
@@ -1828,7 +1870,23 @@ def list_promotion_requests(admin_user: dict = Depends(get_admin_user)):
         ORDER BY sj.created_at DESC
     """).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [
+        {
+            "id": r["id"],
+            "job_id": r["id"],
+            "user_id": r["user_id"],
+            "user_email": r["user_email"],
+            "name": r["proposed_name"] or r["query"] or f"Scraped Dataset #{r['id']}",
+            "category": r["proposed_category"] or "Scraped Leads",
+            "status": r["promotion_status"] or "pending",
+            "created_at": str(r["created_at"]) if r["created_at"] else "",
+            "division": r["division"],
+            "district": r["district"],
+            "area": r["area"],
+            "result_count": r["result_count"]
+        }
+        for r in rows
+    ]
 
 @app.post("/api/admin/promotion-requests/{job_id}/approve")
 def approve_promotion_request(job_id: int, admin_user: dict = Depends(get_admin_user)):
@@ -1838,8 +1896,15 @@ def approve_promotion_request(job_id: int, admin_user: dict = Depends(get_admin_
         conn.close()
         raise HTTPException(status_code=404, detail="Scrape job or result file not found.")
 
-    ds_name = job["proposed_name"] or job["query"]
-    ds_cat = job["proposed_category"] or "Coaching Center"
+    ds_name = job["proposed_name"] or job["query"] or f"Scraped Dataset #{job_id}"
+    ds_cat = job["proposed_category"] or "Scraped Leads"
+
+    existing_ds = conn.execute("SELECT id FROM datasets WHERE file_path LIKE ?", (f"%promoted_{job_id}_%",)).fetchone()
+    if existing_ds:
+        conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved' WHERE id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": f"Dataset '{ds_name}' is already published to public catalog."}
 
     new_filename = f"promoted_{job_id}_{int(time.time())}.xlsx"
     new_path = os.path.join(UPLOAD_FOLDER, new_filename)
@@ -1850,7 +1915,7 @@ def approve_promotion_request(job_id: int, admin_user: dict = Depends(get_admin_
     conn.execute(
         """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, uploaded_by)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, ?)""",
-        (ds_name, ds_cat, job["division"], job["district"], job["area"], rel_path, job["result_count"], admin_user["id"])
+        (ds_name, ds_cat, job["division"], job["district"], job["area"], rel_path, job["result_count"], job["user_id"])
     )
     conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved' WHERE id = ?", (job_id,))
     conn.commit()
