@@ -89,10 +89,11 @@ for _fe in [FRONTEND_URL, FRONTEND_LOCAL_URL, FRONTEND_RENDER_URL]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins if FRONTEND_URL else ["*"],
-    allow_origin_regex=r"https?://.*" if FRONTEND_URL else None,
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_headers=["*"],
     allow_methods=["*"],
+    allow_private_network=True,
 )
 
 UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
