@@ -65,6 +65,35 @@ def convert_placeholders(sql: str) -> str:
         res.append(ch)
     return ''.join(res)
 
+def convert_placeholders_to_qmark(sql: str) -> str:
+    """Replaces '%s' with '?' outside single/double quoted literals for SQLite."""
+    res = []
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == '\\' and (in_single or in_double):
+            escaped = not escaped
+            res.append(ch)
+            i += 1
+            continue
+        if ch == "'" and not in_double and not escaped:
+            in_single = not in_single
+        elif ch == '"' and not in_single and not escaped:
+            in_double = not in_double
+        elif ch == '%' and i + 1 < n and sql[i+1] == 's' and not in_single and not in_double:
+            res.append('?')
+            escaped = False
+            i += 2
+            continue
+        escaped = False
+        res.append(ch)
+        i += 1
+    return ''.join(res)
+
 def translate_query(query: str, allow_returning: bool = True):
     """
     Translates an SQLite-style query into standard PostgreSQL:
@@ -238,6 +267,11 @@ class SqliteCursorWrapper:
         self._cursor = raw_cursor
 
     def execute(self, query, params=None):
+        sql = query.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        # Replace %s with ? outside quotes for SQLite compatibility
+        if "%s" in sql:
+            sql = convert_placeholders_to_qmark(sql)
+
         if params is not None:
             if isinstance(params, (list, tuple)):
                 clean_params = tuple(int(p) if isinstance(p, bool) else p for p in params)
@@ -245,8 +279,8 @@ class SqliteCursorWrapper:
                 clean_params = {k: int(v) if isinstance(v, bool) else v for k, v in params.items()}
             else:
                 clean_params = (int(params) if isinstance(params, bool) else params,)
-            return self._cursor.execute(query, clean_params)
-        return self._cursor.execute(query)
+            return self._cursor.execute(sql, clean_params)
+        return self._cursor.execute(sql)
 
     def executemany(self, query, seq_of_params):
         return self._cursor.executemany(query, seq_of_params)
@@ -420,9 +454,7 @@ def get_db():
 # ── Schema Initialization & Migrations ─────────────────────────
 def init_db():
     url = get_clean_database_url()
-    if not url:
-        print("[DATABASE WARNING] DATABASE_URL is not configured in backend/.env. Supabase PostgreSQL initialization skipped.")
-        return
+    is_postgres = bool(url and not url.startswith("sqlite"))
 
     conn = get_db()
     cursor = conn.cursor()
@@ -720,7 +752,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-    print("[OK] Supabase PostgreSQL database schema initialized successfully.")
+    if is_postgres:
+        print("[OK] Supabase PostgreSQL database schema initialized successfully.")
+    else:
+        print("[OK] Local SQLite database schema initialized successfully (datakarkhana_local.db).")
 
 def reset_db_only_superadmin():
     conn = get_db()

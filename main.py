@@ -156,11 +156,6 @@ def startup_event():
     t.start()
 
     try:
-        from database import get_clean_database_url
-        if not get_clean_database_url():
-            print("[SUPABASE NOTICE] DATABASE_URL is not set yet in backend/.env.")
-            return
-
         conn = get_db()
         try:
             row = conn.execute("SELECT 1 FROM users LIMIT 1;").fetchone()
