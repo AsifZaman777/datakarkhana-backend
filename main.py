@@ -56,6 +56,26 @@ async def db_connection_lifecycle_middleware(request: Request, call_next):
         _request_db_conns.reset(token)
 
 # Allow CORS for React frontend (standard dev port 5173 / 3000 / localhost & production FRONTEND_URL)
+@app.middleware("http")
+async def private_network_access_middleware(request: Request, call_next):
+    # Respond to Chromium Private Network Access (PNA) preflight checks
+    if request.method == "OPTIONS" and (
+        request.headers.get("access-control-request-private-network")
+        or request.headers.get("access-control-request-method")
+    ):
+        origin = request.headers.get("origin") or "*"
+        response = Response(status_code=204)
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
 _cors_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
