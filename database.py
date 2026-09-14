@@ -26,11 +26,43 @@ CONFLICT_KEYS = {
     "banned_ips": ("ip_address", None),  # None means DO NOTHING
 }
 
+def get_local_sqlite_path() -> str:
+    """Returns a reliable, writable path for SQLite across all operating systems."""
+    custom_dir = os.getenv("DATAKARKHANA_DATA_DIR")
+    if custom_dir:
+        try:
+            os.makedirs(custom_dir, exist_ok=True)
+            return os.path.join(custom_dir, "datakarkhana_local.db")
+        except Exception:
+            pass
+
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        try:
+            target_dir = os.path.join(appdata, "datakarkhana")
+            os.makedirs(target_dir, exist_ok=True)
+            return os.path.join(target_dir, "datakarkhana_local.db")
+        except Exception:
+            pass
+
+    home_dir = os.path.expanduser("~/.datakarkhana")
+    try:
+        os.makedirs(home_dir, exist_ok=True)
+        return os.path.join(home_dir, "datakarkhana_local.db")
+    except Exception:
+        pass
+
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "datakarkhana_local.db")
+
 def get_clean_database_url() -> str:
     url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL") or os.getenv("POSTGRES_URL") or DATABASE_URL
     if not url:
         return ""
     url = url.strip().strip("'").strip('"')
+    # Filter out template placeholders from .env.example or unconfigured environments
+    invalid_markers = ["[YOUR-PASSWORD]", "[PROJECT-REF]", "your_password", "<password>", "example.com", "your_brevo"]
+    if any(marker in url for marker in invalid_markers):
+        return ""
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
     # If using Supabase pooler, switch port 5432 to 6543 (transaction mode) to avoid EMAXCONNSESSION (pool_size limit)
@@ -41,6 +73,10 @@ def get_clean_database_url() -> str:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}sslmode=require"
     return url
+
+def is_sqlite_active() -> bool:
+    url = get_clean_database_url()
+    return not bool(url and not url.startswith("sqlite"))
 
 def convert_placeholders(sql: str) -> str:
     """Replaces '?' with '%s' outside single/double quoted literals."""
@@ -365,24 +401,41 @@ def get_pool():
         url = get_clean_database_url()
         if not url:
             return None
-        _db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=5, maxconn=80, dsn=url)
+        try:
+            _db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=2, maxconn=80, dsn=url)
+        except Exception as e:
+            print(f"[DATABASE NOTICE] Unable to create PostgreSQL pool ({e}).")
+            _db_pool = None
+            return None
     return _db_pool
+
+def get_sqlite_db():
+    db_path = get_local_sqlite_path()
+    raw_conn = sqlite3.connect(db_path, check_same_thread=False)
+    wrapper = SqliteConnectionWrapper(raw_conn)
+    active_conns = _request_db_conns.get()
+    if active_conns is not None:
+        active_conns.append(wrapper)
+    return wrapper
 
 def get_db():
     url = get_clean_database_url()
     # If no Postgres URL configured or local SQLite requested, use zero-config SQLite
     if not url or url.startswith("sqlite"):
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datakarkhana_local.db")
-        raw_conn = sqlite3.connect(db_path, check_same_thread=False)
-        wrapper = SqliteConnectionWrapper(raw_conn)
-        active_conns = _request_db_conns.get()
-        if active_conns is not None:
-            active_conns.append(wrapper)
-        return wrapper
+        return get_sqlite_db()
 
-    pool = get_pool()
+    pool = None
+    try:
+        pool = get_pool()
+    except Exception as e:
+        print(f"[DATABASE NOTICE] PostgreSQL connection failed ({e}). Operating in Local SQLite fallback mode.")
+        return get_sqlite_db()
+
+    if pool is None:
+        return get_sqlite_db()
+
     raw_conn = None
-    max_retries = 20
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             raw_conn = pool.getconn()
@@ -401,9 +454,11 @@ def get_db():
                 except Exception:
                     pass
                 raw_conn = None
-                if attempt >= 3:
+                if attempt >= 1:
                     reset_pool()
                     pool = get_pool()
+                    if pool is None:
+                        return get_sqlite_db()
                 continue
 
             break
@@ -419,7 +474,7 @@ def get_db():
                         active_conns.append(wrapper)
                     return wrapper
                 except Exception:
-                    raise
+                    return get_sqlite_db()
         except Exception:
             if raw_conn is not None:
                 try:
@@ -427,28 +482,35 @@ def get_db():
                 except Exception:
                     pass
                 raw_conn = None
-            if attempt >= 5:
+            if attempt >= 1:
                 reset_pool()
-                pool = get_pool()
+                try:
+                    pool = get_pool()
+                    if pool is None:
+                        return get_sqlite_db()
+                except Exception:
+                    return get_sqlite_db()
             time.sleep(0.02)
 
     if raw_conn is None:
         try:
             raw_conn = pool.getconn()
-        except psycopg2.pool.PoolError:
-            raw_conn = psycopg2.connect(get_clean_database_url())
-            wrapper = PostgresConnectionWrapper(raw_conn, None)
-            active_conns = _request_db_conns.get()
-            if active_conns is not None:
-                active_conns.append(wrapper)
-            return wrapper
+        except Exception:
+            try:
+                raw_conn = psycopg2.connect(get_clean_database_url())
+                wrapper = PostgresConnectionWrapper(raw_conn, None)
+                active_conns = _request_db_conns.get()
+                if active_conns is not None:
+                    active_conns.append(wrapper)
+                return wrapper
+            except Exception as err:
+                print(f"[DATABASE NOTICE] PostgreSQL connection failed ({err}). Operating in Local SQLite fallback mode.")
+                return get_sqlite_db()
 
     wrapper = PostgresConnectionWrapper(raw_conn, pool)
-
     active_conns = _request_db_conns.get()
     if active_conns is not None:
         active_conns.append(wrapper)
-
     return wrapper
 
 # ── Schema Initialization & Migrations ─────────────────────────

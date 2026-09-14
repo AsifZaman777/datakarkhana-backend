@@ -94,9 +94,32 @@ Local Scraper Logs            Local PC                    User Only
    - Only the Render backend connects to PostgreSQL.
 
 2. **Local SQLite (`datakarkhana_local.db`)**:
-   - Runs automatically on the user's PC when `DATABASE_URL` is omitted.
+   - Runs automatically on the user's PC when `DATABASE_URL` is omitted or unconfigured.
+   - Automatically detects template placeholders (e.g. `[YOUR-PASSWORD]`) and defaults to local SQLite with zero errors.
+   - Stored in the user's writable data folder (`%APPDATA%/datakarkhana/` on Windows / `~/.datakarkhana/` on Mac).
    - Zero configuration, zero passwords, zero cloud network dependency.
    - Stores private scratch jobs, local campaign histories, and offline caches.
+
+### 🌐 Smart Dynamic Route Dispatching (`client.ts`)
+The desktop client automatically routes every outgoing request to its proper destination:
+
+| Route Namespace | Target Destination | Purpose |
+| :--- | :--- | :--- |
+| `/api/auth/*` | **Render Cloud Server** | Authenticates against Supabase; returns secure JWT |
+| `/api/admin/*` | **Render Cloud Server** | Manages packages, customers, and payment verifications |
+| `/api/datasets/*` | **Render Cloud Server** | Serves shared marketplace catalog & dataset unlocks |
+| `/api/payments/*` | **Render Cloud Server** | Manages bKash/Pathao requests & credit transactions |
+| `/api/license/*` | **Render Cloud Server** | Verifies production license keys and generates tokens |
+| `/api/requests/*` | **Render Cloud Server** | Submits custom dataset search orders |
+| `/api/scraper/*` | **Local Engine (`127.0.0.1:8000`)** | Runs Selenium Chrome using user's residential IP |
+| `/api/marketing/*` | **Local Engine (`127.0.0.1:8000`)** | Runs WhatsApp Web session & local email campaigns |
+| `/ws/scraper/*` | **Local Engine (`ws://127.0.0.1:8000`)** | Streams live Chromium frame previews to terminal |
+
+### 🔄 User Profile & Credit Deduction Synchronization
+1. **User Sign-in:** User logs in via the UI. The request is routed to Render Cloud, which validates credentials against Supabase and returns a signed JWT.
+2. **Local Scraping Launch:** When the user launches a scrape or WhatsApp campaign, the request hits the Local Python Engine (`127.0.0.1:8000`) with the Bearer JWT.
+3. **Automatic User Upsert:** The Local Engine decodes the JWT, verifies the user, queries Render `/api/auth/me` to fetch current credits, and upserts the profile into the local SQLite database.
+4. **Authoritative Cloud Credit Deduction:** The Local Engine deducts credits locally and invokes the Cloud endpoint `/api/user/deduct-credits` with the user's token so that Supabase PostgreSQL balances update immediately.
 
 ---
 

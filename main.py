@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
-from database import get_db, init_db, _request_db_conns
+from database import get_db, init_db, _request_db_conns, is_sqlite_active
 from auth import hash_password, verify_password, create_jwt_token, decode_jwt_token
 from license_service import (
     generate_production_license,
@@ -112,7 +112,7 @@ SERVER_START_TIME = time.time()
 @app.get("/health")
 @app.get("/api/health")
 def health_check():
-    """Lightweight health check endpoint for uptime monitors and Render keep-alive pings"""
+    """Lightweight health check endpoint for uptime monitors, desktop dots, and Render keep-alive pings"""
     db_status = "ok"
     try:
         conn = get_db()
@@ -123,10 +123,12 @@ def health_check():
 
     uptime_sec = int(time.time() - SERVER_START_TIME)
     uptime_str = f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s"
+    db_mode = "sqlite" if is_sqlite_active() else "postgres"
     return {
         "status": "healthy" if "unhealthy" not in db_status else "degraded",
         "service": "MarketingOstad Backend",
-        "database": db_status,
+        "database": "ok" if "unhealthy" not in db_status else db_status,
+        "mode": db_mode,
         "uptime": uptime_str,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
@@ -225,6 +227,73 @@ def get_current_user(request: Request, authorization: Optional[str] = Header(Non
         
     user = conn.execute("SELECT * FROM users WHERE id = ?", (user_payload["user_id"],)).fetchone()
     conn.close()
+
+    if not user:
+        # If in local mode, attempt to sync/fetch profile from Render Cloud API using user's valid JWT
+        cloud_url = os.getenv("RENDER_EXTERNAL_URL") or "https://datakarkhana-backend.onrender.com"
+        fetched_cloud_user = None
+        try:
+            import requests
+            resp = requests.get(
+                f"{cloud_url.rstrip('/')}/api/auth/me",
+                headers={"Authorization": f"Bearer {raw_token}"},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                fetched_cloud_user = resp.json()
+        except Exception:
+            pass
+
+        if fetched_cloud_user:
+            # Sync user into local SQLite database
+            conn_sync = get_db()
+            try:
+                conn_sync.execute("""
+                    INSERT INTO users (id, email, full_name, password_hash, role, credits, is_verified, is_banned)
+                    VALUES (?, ?, ?, 'cloud_synced', ?, ?, ?, ?)
+                    ON CONFLICT (id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        full_name = EXCLUDED.full_name,
+                        role = EXCLUDED.role,
+                        credits = EXCLUDED.credits,
+                        is_verified = EXCLUDED.is_verified,
+                        is_banned = EXCLUDED.is_banned;
+                """, (
+                    fetched_cloud_user.get("id", user_payload["user_id"]),
+                    fetched_cloud_user.get("email", user_payload.get("email", "")),
+                    fetched_cloud_user.get("full_name", user_payload.get("full_name", "")),
+                    fetched_cloud_user.get("role", user_payload.get("role", "user")),
+                    fetched_cloud_user.get("credits", 0),
+                    fetched_cloud_user.get("is_verified", 1),
+                    fetched_cloud_user.get("is_banned", 0)
+                ))
+                conn_sync.commit()
+                user = conn_sync.execute("SELECT * FROM users WHERE id = ?", (user_payload["user_id"],)).fetchone()
+            except Exception as sync_err:
+                print(f"[CLOUD USER SYNC NOTICE] {sync_err}")
+            finally:
+                conn_sync.close()
+        elif is_sqlite_active():
+            # Fallback for offline SQLite using JWT claims
+            conn_sync = get_db()
+            try:
+                conn_sync.execute("""
+                    INSERT INTO users (id, email, full_name, password_hash, role, credits, is_verified, is_banned)
+                    VALUES (?, ?, ?, 'local_offline', ?, 50, 1, 0)
+                    ON CONFLICT (id) DO NOTHING;
+                """, (
+                    user_payload["user_id"],
+                    user_payload.get("email", "user@local"),
+                    user_payload.get("full_name", "Local User"),
+                    user_payload.get("role", "user")
+                ))
+                conn_sync.commit()
+                user = conn_sync.execute("SELECT * FROM users WHERE id = ?", (user_payload["user_id"],)).fetchone()
+            except Exception as offline_err:
+                print(f"[OFFLINE USER UPSERT NOTICE] {offline_err}")
+            finally:
+                conn_sync.close()
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -791,6 +860,55 @@ def me(current_user: dict = Depends(get_current_user)):
         "is_banned": current_user.get("is_banned", 0),
         "warning_message": current_user.get("warning_message") or ""
     }
+
+class DeductCreditRequest(BaseModel):
+    amount: int
+    description: str = "Local operation deduction"
+
+@app.post("/api/user/deduct-credits")
+def deduct_user_credits(
+    req: DeductCreditRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Authoritative cloud endpoint to deduct credits from user account"""
+    if req.amount <= 0:
+        return {"success": True, "credits": current_user.get("credits", 0)}
+    if current_user.get("role") in ("admin", "superadmin"):
+        return {"success": True, "credits": current_user.get("credits", 99999)}
+
+    conn = get_db()
+    try:
+        user = conn.execute("SELECT credits FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+        current_credits = user["credits"] if user else 0
+        if current_credits < req.amount:
+            conn.close()
+            raise HTTPException(status_code=403, detail=f"Insufficient credits (has {current_credits}, requires {req.amount}).")
+        conn.execute("UPDATE users SET credits = credits - ? WHERE id = ?", (req.amount, current_user["id"]))
+        conn.execute(
+            "INSERT INTO credit_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, 'deduct', ?)",
+            (current_user["id"], req.amount, req.description)
+        )
+        conn.commit()
+        updated_user = conn.execute("SELECT credits FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+        return {"success": True, "credits": updated_user["credits"] if updated_user else current_credits - req.amount}
+    finally:
+        conn.close()
+
+def sync_credit_deduction_to_cloud(auth_token: Optional[str], amount: int, description: str):
+    """If running in local SQLite mode, syncs credit deduction to Render Cloud API"""
+    if not auth_token or not is_sqlite_active():
+        return
+    cloud_url = os.getenv("RENDER_EXTERNAL_URL") or "https://datakarkhana-backend.onrender.com"
+    try:
+        import requests
+        requests.post(
+            f"{cloud_url.rstrip('/')}/api/user/deduct-credits",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            json={"amount": amount, "description": description},
+            timeout=5
+        )
+    except Exception as e:
+        print(f"[CLOUD CREDIT DEDUCT NOTICE] {e}")
 
 # ── Security Endpoints ───────────────────────────────────
 
@@ -1649,6 +1767,7 @@ def update_dataset_request_status(request_id: int, req: DatasetRequestStatusUpda
 def trigger_scrape(
     req: ScrapeRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     current_user: dict = Depends(get_current_user),
     _license_valid: bool = Depends(check_desktop_license)
 ):
@@ -1674,6 +1793,9 @@ def trigger_scrape(
             "INSERT INTO credit_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, 'deduct', ?)",
             (current_user["id"], cost, f"Google Maps Scraper Run ({len(query_list)} queries)")
         )
+        auth_header = request.headers.get("authorization", "")
+        raw_tok = auth_header.split(" ", 1)[1] if auth_header.startswith("Bearer ") else None
+        sync_credit_deduction_to_cloud(raw_tok, cost, f"Google Maps Scraper Run ({len(query_list)} queries)")
     
     cursor = conn.cursor()
     cursor.execute(
