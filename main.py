@@ -2169,6 +2169,33 @@ def sync_dataset_to_cloud(
             detail="Cloud dataset synchronization is an exclusive feature for Pro Growth Pack and Enterprise Mega Pack users, or requires administrator authorization."
         )
 
+    # Check per-user cloud upload limit
+    user_row = conn.execute("SELECT max_sync_files FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+    max_sync = user_row["max_sync_files"] if user_row and "max_sync_files" in user_row.keys() and user_row["max_sync_files"] is not None else 5
+    
+    if max_sync > 0:
+        count_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM datasets WHERE uploaded_by = ? AND (is_synced = 1 OR file_path LIKE ?)",
+            (current_user["id"], "supabase://%")
+        ).fetchone()
+        active_synced_count = count_row["cnt"] if count_row else 0
+        
+        is_update = False
+        if source_job_id:
+            existing_ds = conn.execute(
+                "SELECT id FROM datasets WHERE uploaded_by = ? AND source_job_id = ?",
+                (current_user["id"], source_job_id)
+            ).fetchone()
+            if existing_ds:
+                is_update = True
+
+        if not is_update and active_synced_count >= max_sync:
+            conn.close()
+            raise HTTPException(
+                status_code=403,
+                detail=f"Cloud upload limit reached. Your account is allowed a maximum of {max_sync} synced cloud datasets. Please desync unused datasets or contact the administrator to increase your limit."
+            )
+
     # Verify Supabase Cloud Storage
     is_storage_ok = is_supabase_storage_configured()
     is_testing = os.getenv("TESTING") == "1"
@@ -2278,6 +2305,58 @@ def sync_dataset_to_cloud(
         "success": True,
         "dataset_id": ds_id,
         "message": f'Dataset "{name}" successfully synced to PostgreSQL cloud!'
+    }
+
+@app.post("/api/datasets/{dataset_id}/desync")
+def desync_dataset(dataset_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Desyncs a dataset from the cloud:
+    1. Removes the dataset file from Supabase Storage bucket.
+    2. Removes the dataset row from PostgreSQL.
+    3. Resets source scrape_jobs.is_synced = 0.
+    4. PRESERVES the local file on disk intact.
+    """
+    conn = get_db()
+    is_admin = current_user.get("role") in ("admin", "superadmin")
+    
+    clean_id = str(dataset_id).replace("job_", "")
+    ds = conn.execute("SELECT * FROM datasets WHERE id = ? OR source_job_id = ?", (clean_id, clean_id)).fetchone()
+    if not ds:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Dataset not found in cloud database.")
+
+    if not is_admin and ds["uploaded_by"] != current_user["id"]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Permission denied. You can only desync your own datasets.")
+
+    file_path = ds["file_path"]
+    source_job_id = ds["source_job_id"]
+    ds_real_id = ds["id"]
+
+    # 1. If stored in Supabase Storage, delete the file from the cloud bucket
+    if file_path and str(file_path).startswith("supabase://"):
+        from supabase_storage import delete_dataset_file
+        try:
+            delete_dataset_file(file_path)
+        except Exception as e:
+            print(f"[DESYNC NOTICE] Error deleting from Supabase Storage: {e}")
+
+    # 2. If tied to a scrape job, update scrape_jobs.is_synced = 0 (keeping local result file untouched)
+    if source_job_id:
+        try:
+            conn.execute("UPDATE scrape_jobs SET is_synced = 0 WHERE id = ?", (source_job_id,))
+        except Exception:
+            pass
+
+    # 3. Delete dataset entry from cloud PostgreSQL to free up user's upload limit
+    conn.execute("DELETE FROM datasets WHERE id = ?", (ds_real_id,))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "dataset_id": ds_real_id,
+        "message": f'Dataset "{ds["name"]}" has been desynced from the cloud. Cloud bucket storage has been freed; your local file remains intact.'
     }
 
 @app.post("/api/datasets/promote-request")
@@ -3982,14 +4061,23 @@ def unapprove_user_brevo(user_id: int, current_user: dict = Depends(get_admin_us
 class AllowSyncRequest(BaseModel):
     allow_sync: int
 
+class UploadLimitRequest(BaseModel):
+    max_sync_files: int
+
 @app.get("/api/admin/users")
 def get_all_users(admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
-    users = conn.execute("SELECT id, email, full_name, role, credits, is_banned, warning_message, brevo_api_key, brevo_account_status, daily_email_limit, allow_sync, created_at FROM users ORDER BY id ASC").fetchall()
+    users = conn.execute("SELECT id, email, full_name, role, credits, is_banned, warning_message, brevo_api_key, brevo_account_status, daily_email_limit, allow_sync, max_sync_files, created_at FROM users ORDER BY id ASC").fetchall()
     result = []
     for u in users:
         u_dict = dict(u)
         u_dict["plan_tier"] = get_user_plan_tier(conn, u_dict["id"], u_dict["email"], u_dict["role"])
+        u_dict["max_sync_files"] = u_dict.get("max_sync_files") if u_dict.get("max_sync_files") is not None else 5
+        count_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM datasets WHERE uploaded_by = ? AND (is_synced = 1 OR file_path LIKE ?)",
+            (u_dict["id"], "supabase://%")
+        ).fetchone()
+        u_dict["synced_files_count"] = count_row["cnt"] if count_row else 0
         result.append(u_dict)
     conn.close()
     return result
@@ -4010,6 +4098,84 @@ def set_user_allow_sync(target_user_id: int, req: AllowSyncRequest, admin_user: 
         "success": True, 
         "allow_sync": val, 
         "message": f"Cloud sync permission {'enabled' if val == 1 else 'disabled'} for {u['email']}."
+    }
+
+@app.post("/api/admin/users/{target_user_id}/upload-limit")
+def set_user_upload_limit(target_user_id: int, req: UploadLimitRequest, admin_user: dict = Depends(get_admin_user)):
+    conn = get_db()
+    u = conn.execute("SELECT id, email FROM users WHERE id = ?", (target_user_id,)).fetchone()
+    if not u:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    new_limit = max(0, req.max_sync_files)
+    conn.execute("UPDATE users SET max_sync_files = ? WHERE id = ?", (new_limit, target_user_id))
+    conn.commit()
+    conn.close()
+    return {
+        "success": True,
+        "max_sync_files": new_limit,
+        "message": f"Cloud upload limit set to {new_limit} datasets for {u['email']}."
+    }
+
+@app.get("/api/admin/users/{target_user_id}/datasets")
+def get_user_datasets(target_user_id: int, admin_user: dict = Depends(get_admin_user)):
+    conn = get_db()
+    u = conn.execute("SELECT id, email, full_name FROM users WHERE id = ?", (target_user_id,)).fetchone()
+    if not u:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    datasets = conn.execute(
+        """SELECT id, name, category, division, district, area, row_count, file_path, 
+                  is_synced, is_active, promotion_status, source_job_id, created_at 
+           FROM datasets 
+           WHERE uploaded_by = ? 
+           ORDER BY id DESC""",
+        (target_user_id,)
+    ).fetchall()
+    
+    result = []
+    for d in datasets:
+        d_dict = dict(d)
+        d_dict["is_cloud_stored"] = bool(d_dict.get("file_path") and str(d_dict["file_path"]).startswith("supabase://"))
+        result.append(d_dict)
+
+    conn.close()
+    return {
+        "user": dict(u),
+        "total": len(result),
+        "datasets": result
+    }
+
+@app.get("/api/admin/storage/overview")
+def get_storage_overview(admin_user: dict = Depends(get_admin_user)):
+    from supabase_storage import is_supabase_storage_configured, get_bucket_name, get_effective_supabase_url
+    conn = get_db()
+    
+    total_cloud_ds = conn.execute(
+        "SELECT COUNT(*) as cnt, COALESCE(SUM(row_count), 0) as total_rows FROM datasets WHERE is_synced = 1 OR file_path LIKE ?",
+        ("supabase://%",)
+    ).fetchone()
+    
+    breakdown = conn.execute(
+        """SELECT u.id, u.email, u.full_name, u.allow_sync, COALESCE(u.max_sync_files, 5) as max_sync_files,
+                  COUNT(d.id) as synced_files, COALESCE(SUM(d.row_count), 0) as total_leads
+           FROM users u
+           LEFT JOIN datasets d ON d.uploaded_by = u.id AND (d.is_synced = 1 OR d.file_path LIKE ?)
+           GROUP BY u.id, u.email, u.full_name, u.allow_sync, u.max_sync_files
+           ORDER BY synced_files DESC, u.id ASC""",
+        ("supabase://%",)
+    ).fetchall()
+    
+    conn.close()
+    return {
+        "bucket_name": get_bucket_name(),
+        "supabase_configured": is_supabase_storage_configured(),
+        "supabase_url": get_effective_supabase_url(),
+        "total_cloud_datasets": total_cloud_ds["cnt"] if total_cloud_ds else 0,
+        "total_cloud_rows": total_cloud_ds["total_rows"] if total_cloud_ds else 0,
+        "users": [dict(b) for b in breakdown]
     }
 
 @app.post("/api/admin/users/add-credits")

@@ -517,6 +517,121 @@ class TestFullApplicationBackend(unittest.TestCase):
                 self.assertEqual(data["leads"][0]["Name"], "Cloud Lead 1")
 
 
+    def test_24_admin_storage_overview(self):
+        """Test GET /api/admin/storage/overview returns bucket and stats overview"""
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+        res = client.get("/api/admin/storage/overview", headers=admin_headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn("bucket_name", data)
+        self.assertIn("supabase_configured", data)
+        self.assertIn("total_cloud_datasets", data)
+        self.assertIn("total_cloud_rows", data)
+        self.assertIn("users", data)
+
+    def test_25_admin_set_user_upload_limit_and_get_datasets(self):
+        """Test admin setting max_sync_files limit and inspecting user datasets"""
+        conn = get_db()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
+        user_id = user_row["id"]
+        conn.close()
+
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+        # Set limit to 2
+        res = client.post(f"/api/admin/users/{user_id}/upload-limit", json={"max_sync_files": 2}, headers=admin_headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["max_sync_files"], 2)
+
+        # Inspect user datasets
+        res_ds = client.get(f"/api/admin/users/{user_id}/datasets", headers=admin_headers)
+        self.assertEqual(res_ds.status_code, 200)
+        self.assertIn("datasets", res_ds.json())
+        self.assertIn("user", res_ds.json())
+
+    def test_26_sync_limit_enforcement(self):
+        """Test that syncing enforces max_sync_files limit when quota is exceeded"""
+        from unittest.mock import patch
+        conn = get_db()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
+        user_id = user_row["id"]
+        # Set limit to 1
+        conn.execute("UPDATE users SET max_sync_files = 1, allow_sync = 1 WHERE id = ?", (user_id,))
+        # Insert 1 existing dataset for user
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO datasets (name, category, file_path, row_count, uploaded_by, is_active)
+               VALUES ('Existing Cloud DS', 'Leads', 'supabase://datasets/synced/ex.xlsx', 10, ?, 1)""",
+            (user_id,)
+        )
+        existing_ds_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        # Attempt to sync another dataset -> should fail with 403
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        dummy_file = ("test.xlsx", b"dummy content", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        data = {
+            "name": "Over Limit Dataset",
+            "category": "Test",
+            "row_count": "5"
+        }
+        res = client.post("/api/datasets/sync", data=data, files={"file": dummy_file}, headers=user_headers)
+        self.assertEqual(res.status_code, 403)
+        self.assertIn("Upload limit reached", res.json()["detail"])
+
+        # Clean up existing test dataset
+        conn = get_db()
+        conn.execute("DELETE FROM datasets WHERE id = ?", (existing_ds_id,))
+        conn.commit()
+        conn.close()
+
+    def test_27_desync_dataset(self):
+        """Test desyncing a dataset removes cloud dataset record and resets scrape_jobs.is_synced to 0"""
+        from unittest.mock import patch
+        conn = get_db()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
+        user_id = user_row["id"]
+
+        # Create a mock scrape job
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO scrape_jobs (user_id, query, status, is_synced)
+               VALUES (?, 'Desync Test Job', 'done', 1)""",
+            (user_id,)
+        )
+        job_id = cursor.lastrowid
+
+        # Create a matching dataset in cloud
+        cursor.execute(
+            """INSERT INTO datasets (name, category, file_path, row_count, uploaded_by, is_active, source_job_id)
+               VALUES ('Desync Test Cloud DS', 'Leads', 'supabase://datasets/synced/desync_test.xlsx', 15, ?, 1, ?)""",
+            (user_id, job_id)
+        )
+        ds_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        with patch("supabase_storage.delete_dataset_file", return_value=(True, "")):
+            user_headers = {"Authorization": f"Bearer {self.user_token}"}
+            res = client.post(f"/api/datasets/{ds_id}/desync", headers=user_headers)
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue(res.json()["success"])
+
+            # Verify dataset is deleted from DB
+            conn = get_db()
+            deleted_ds = conn.execute("SELECT * FROM datasets WHERE id = ?", (ds_id,)).fetchone()
+            self.assertIsNone(deleted_ds)
+
+            # Verify scrape job is_synced is reset to 0
+            job = conn.execute("SELECT is_synced FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
+            self.assertEqual(job["is_synced"], 0)
+            
+            # Clean up job
+            conn.execute("DELETE FROM scrape_jobs WHERE id = ?", (job_id,))
+            conn.commit()
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
 

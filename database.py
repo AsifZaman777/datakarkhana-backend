@@ -538,6 +538,7 @@ def init_db():
             brevo_account_status TEXT DEFAULT 'none',
             daily_email_limit INTEGER DEFAULT 300,
             allow_sync INTEGER DEFAULT 0,
+            max_sync_files INTEGER DEFAULT 5,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -795,12 +796,20 @@ def init_db():
         except Exception:
             pass
 
-    # Migrations for users (add allow_sync)
+    # Migrations for users (add allow_sync & max_sync_files)
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_sync INTEGER DEFAULT 0;")
     except Exception:
         try:
             cursor.execute("ALTER TABLE users ADD COLUMN allow_sync INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS max_sync_files INTEGER DEFAULT 5;")
+    except Exception:
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN max_sync_files INTEGER DEFAULT 5;")
         except Exception:
             pass
 
