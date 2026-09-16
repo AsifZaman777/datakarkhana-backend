@@ -275,8 +275,9 @@ class TestFullApplicationBackend(unittest.TestCase):
         conn = get_db()
         user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
         user_id = user_row["id"]
-        # Ensure user starts with allow_sync = 0
-        conn.execute("UPDATE users SET allow_sync = 0 WHERE id = ?", (user_id,))
+        # Ensure user starts with allow_sync = 0 and max_sync_files = 5, clean old test datasets
+        conn.execute("UPDATE users SET allow_sync = 0, max_sync_files = 5 WHERE id = ?", (user_id,))
+        conn.execute("DELETE FROM datasets WHERE uploaded_by = ?", (user_id,))
         conn.commit()
         conn.close()
 
@@ -413,6 +414,13 @@ class TestFullApplicationBackend(unittest.TestCase):
     def test_21_supabase_storage_unconfigured_alert(self):
         """Verify that when Supabase Storage is not configured and not testing, endpoints return HTTP 503 alert"""
         from unittest.mock import patch
+        conn = get_db()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
+        user_id = user_row["id"]
+        conn.execute("UPDATE users SET allow_sync = 1, max_sync_files = 10 WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
         user_headers = {"Authorization": f"Bearer {self.user_token}"}
         # Temporarily disable TESTING flag and mock unconfigured storage to test production alert behavior
         old_val = os.environ.get("TESTING")
@@ -577,11 +585,12 @@ class TestFullApplicationBackend(unittest.TestCase):
         }
         res = client.post("/api/datasets/sync", data=data, files={"file": dummy_file}, headers=user_headers)
         self.assertEqual(res.status_code, 403)
-        self.assertIn("Upload limit reached", res.json()["detail"])
+        self.assertIn("Cloud upload limit reached", res.json()["detail"])
 
         # Clean up existing test dataset
         conn = get_db()
         conn.execute("DELETE FROM datasets WHERE id = ?", (existing_ds_id,))
+        conn.execute("UPDATE users SET max_sync_files = 5 WHERE id = ?", (user_id,))
         conn.commit()
         conn.close()
 
