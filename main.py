@@ -1159,24 +1159,90 @@ def get_dataset(dataset_id: str, page: int = 1, limit: int = 25, search: Optiona
     if str(dataset_id).startswith("job_"):
         job_real_id = str(dataset_id).replace("job_", "")
         job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_real_id,)).fetchone()
+        synced_ds = conn.execute("SELECT * FROM datasets WHERE source_job_id = ?", (job_real_id,)).fetchone()
         conn.close()
-        if not job or not job["result_path"]:
-            raise HTTPException(status_code=404, detail="Private scrape job or file not found.")
-            
-        file_path = job["result_path"]
+
+        file_path = None
+        if job and job["result_path"]:
+            file_path = job["result_path"]
+        elif synced_ds and synced_ds["file_path"]:
+            file_path = synced_ds["file_path"]
+
+        # Resolve candidate paths across local results, uploads, and project folders
         if file_path and not os.path.exists(file_path):
             fn = os.path.basename(file_path.replace("\\", "/"))
-            if os.path.exists(os.path.join(SCRAPE_RESULTS_FOLDER, fn)):
-                file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fn)
-                
+            candidates = [
+                os.path.join(SCRAPE_RESULTS_FOLDER, fn),
+                os.path.join(os.path.dirname(__file__), "scrape_results", fn),
+                os.path.join(UPLOAD_FOLDER, fn),
+                os.path.join(os.path.dirname(__file__), "uploads", fn),
+            ]
+            found = False
+            for c in candidates:
+                if c and os.path.exists(c):
+                    file_path = c
+                    found = True
+                    break
+            if not found:
+                file_path = None
+
+        if not file_path and os.path.exists(SCRAPE_RESULTS_FOLDER):
+            for fname in os.listdir(SCRAPE_RESULTS_FOLDER):
+                if f"_{job_real_id}." in fname or f"job_{job_real_id}" in fname:
+                    file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fname)
+                    break
+
+        job_name = (job["query"] if job and "query" in job.keys() and job["query"] else (synced_ds["name"] if synced_ds and "name" in synced_ds.keys() and synced_ds["name"] else f"Scrape Job #{job_real_id}"))
+        job_div = (job["division"] if job and "division" in job.keys() else (synced_ds["division"] if synced_ds and "division" in synced_ds.keys() else "")) or ""
+        job_dist = (job["district"] if job and "district" in job.keys() else (synced_ds["district"] if synced_ds and "district" in synced_ds.keys() else "")) or ""
+        job_area = (job["area"] if job and "area" in job.keys() else (synced_ds["area"] if synced_ds and "area" in synced_ds.keys() else "")) or ""
+        expected_rows = (job["result_count"] if job and "result_count" in job.keys() and job["result_count"] else (synced_ds["row_count"] if synced_ds and "row_count" in synced_ds.keys() and synced_ds["row_count"] else 0))
+
         if not file_path or not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Private scrape job result file missing.")
-            
+            return {
+                "dataset": {
+                    "id": f"job_{job_real_id}",
+                    "name": job_name,
+                    "category": "Private Scraped Dataset",
+                    "division": job_div,
+                    "district": job_dist,
+                    "area": job_area,
+                    "row_count": expected_rows,
+                    "price_credits": 0
+                },
+                "unlocked": True,
+                "leads": [],
+                "total_rows": 0,
+                "page": page,
+                "current_page": page,
+                "page_size": page_size,
+                "pages_count": 1,
+                "notice": "Private scrape job result file is not currently available on this server. If scraped locally, please ensure the local desktop automation engine is running."
+            }
+
         try:
             df = pd.read_csv(file_path, dtype=str) if file_path.endswith(".csv") else pd.read_excel(file_path, dtype=str)
             df = clean_lead_df(df)
         except Exception:
-            raise HTTPException(status_code=500, detail="Failed to parse private job leads file.")
+            return {
+                "dataset": {
+                    "id": f"job_{job_real_id}",
+                    "name": job_name,
+                    "category": "Private Scraped Dataset",
+                    "division": job_div,
+                    "district": job_dist,
+                    "area": job_area,
+                    "row_count": 0,
+                    "price_credits": 0
+                },
+                "unlocked": True,
+                "leads": [],
+                "total_rows": 0,
+                "page": page,
+                "current_page": page,
+                "page_size": page_size,
+                "pages_count": 1
+            }
 
         if search:
             df = df[df.astype(str).apply(lambda x: x.str.contains(search, case=False)).any(axis=1)]
@@ -1190,11 +1256,11 @@ def get_dataset(dataset_id: str, page: int = 1, limit: int = 25, search: Optiona
         return {
             "dataset": {
                 "id": f"job_{job_real_id}",
-                "name": job["query"],
+                "name": job_name,
                 "category": "Private Scraped Dataset",
-                "division": job["division"],
-                "district": job["district"],
-                "area": job["area"],
+                "division": job_div,
+                "district": job_dist,
+                "area": job_area,
                 "row_count": total_rows,
                 "price_credits": 0
             },
@@ -1453,20 +1519,34 @@ def export_dataset(dataset_id: str, request: Request, format: Optional[str] = "e
     if str(dataset_id).startswith("job_"):
         job_real_id = str(dataset_id).replace("job_", "")
         job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_real_id,)).fetchone()
-        if not job:
+        synced_ds = conn.execute("SELECT * FROM datasets WHERE source_job_id = ?", (job_real_id,)).fetchone()
+        if not job and not synced_ds:
             conn.close()
             raise HTTPException(status_code=404, detail="Private scrape job dataset not found.")
 
-        if not is_admin and job["user_id"] != current_user["id"]:
+        job_user_id = job["user_id"] if job else (synced_ds["uploaded_by"] if synced_ds else None)
+        if not is_admin and job_user_id != current_user["id"]:
             conn.close()
             raise HTTPException(status_code=403, detail="Permission denied. You can only export your own scrape jobs.")
 
-        file_path = job["result_path"]
-        title_name = job["query"] or f"Job_{job['id']}"
+        file_path = (job["result_path"] if job and job["result_path"] else (synced_ds["file_path"] if synced_ds else None))
+        title_name = (job["query"] if job and job["query"] else (synced_ds["name"] if synced_ds else f"Job_{job_real_id}"))
         if file_path and not os.path.exists(file_path):
             fn = os.path.basename(file_path.replace("\\", "/"))
-            if os.path.exists(os.path.join(SCRAPE_RESULTS_FOLDER, fn)):
-                file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fn)
+            for c in [
+                os.path.join(SCRAPE_RESULTS_FOLDER, fn),
+                os.path.join(os.path.dirname(__file__), "scrape_results", fn),
+                os.path.join(UPLOAD_FOLDER, fn),
+                os.path.join(os.path.dirname(__file__), "uploads", fn),
+            ]:
+                if os.path.exists(c):
+                    file_path = c
+                    break
+        if not file_path and os.path.exists(SCRAPE_RESULTS_FOLDER):
+            for fname in os.listdir(SCRAPE_RESULTS_FOLDER):
+                if f"_{job_real_id}." in fname or f"job_{job_real_id}" in fname:
+                    file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fname)
+                    break
     else:
         ds = conn.execute("SELECT * FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
         if not ds:

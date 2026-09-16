@@ -385,6 +385,31 @@ class TestFullApplicationBackend(unittest.TestCase):
         self.assertEqual(ds_active["promotion_status"], "approved")
         conn.close()
 
+    def test_view_private_scrape_job_graceful(self):
+        """Verify that viewing a private scrape job (job_{id}) does not crash with 404 if file is missing"""
+        # Create a mock scrape job in the database
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO scrape_jobs (user_id, query, division, district, area, status, result_count, result_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (1, "Dentists in Uttara", "Dhaka", "Dhaka", "Uttara", "done", 42, "non_existent_result_file.xlsx")
+        )
+        job_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        # Call GET /api/datasets/job_{job_id}
+        res = client.get(f"/api/datasets/job_{job_id}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn("dataset", data)
+        self.assertEqual(data["dataset"]["id"], f"job_{job_id}")
+        self.assertEqual(data["dataset"]["name"], "Dentists in Uttara")
+        self.assertTrue(data["unlocked"])
+        self.assertIsInstance(data["leads"], list)
+
 
 if __name__ == "__main__":
     unittest.main()
+
