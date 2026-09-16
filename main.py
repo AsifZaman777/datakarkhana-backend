@@ -1,4 +1,5 @@
 import os
+import re
 import io
 import json
 import time
@@ -36,6 +37,7 @@ from scraper import (
 from senders import run_whatsapp_campaign, write_log_to_file, SCREENSHOTS_FOLDER as CAMPAIGN_SCREENSHOTS
 from config import REGIONS, CATEGORIES, BREVO_API_KEY as CONFIG_BREVO_API_KEY, SMTP_USER as CONFIG_SMTP_USER, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, SUPERADMIN_NAME, FRONTEND_URL, FRONTEND_LOCAL_URL, FRONTEND_RENDER_URL, FRONTEND_MODE, BKASH_NUMBER, BKASH_ACCOUNT_TYPE, PATHAO_NUMBER, PATHAO_ACCOUNT_TYPE, CREDIT_PACKAGES
 from email_templates import get_verification_email_html, get_license_key_email_html
+from supabase_storage import is_supabase_storage_configured, upload_dataset_file, download_dataset_file, get_signed_url
 
 app = FastAPI(title="MarketingOstad API Service")
 
@@ -1054,6 +1056,25 @@ def publish_dataset_to_public(dataset_id: int, current_user: dict = Depends(get_
 def resolve_dataset_file_path(file_path: Optional[str], dataset_id: Optional[Union[int, str]] = None) -> Optional[str]:
     if not file_path:
         return None
+
+    # 1. Handle Supabase Cloud Storage path
+    if str(file_path).startswith("supabase://"):
+        filename = os.path.basename(file_path.replace("\\", "/"))
+        cache_file = os.path.join(UPLOAD_FOLDER, f"supabase_cache_{filename}")
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
+            return cache_file
+        
+        if is_supabase_storage_configured():
+            success, content, err = download_dataset_file(file_path)
+            if success and content:
+                os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+                with open(cache_file, "wb") as f:
+                    f.write(content)
+                return cache_file
+            else:
+                print(f"[SUPABASE STORAGE DOWNLOAD NOTICE] {err}")
+        return None
+
     if os.path.exists(file_path):
         return file_path
     
@@ -1072,6 +1093,18 @@ def resolve_dataset_file_path(file_path: Optional[str], dataset_id: Optional[Uni
         found_path = root_sanitized
     elif os.path.exists(os.path.join(parent_dir, filename)):
         found_path = os.path.join(parent_dir, filename)
+
+    # If file not found locally on disk, try looking up in Supabase Storage
+    if not found_path and is_supabase_storage_configured():
+        for prefix in ["synced", "admin", "promoted"]:
+            remote_path = f"{prefix}/{filename}"
+            success, content, _ = download_dataset_file(remote_path)
+            if success and content:
+                os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+                with open(local_upload, "wb") as f:
+                    f.write(content)
+                found_path = local_upload
+                break
 
     if found_path and dataset_id:
         try:
@@ -1282,6 +1315,19 @@ def get_dataset(dataset_id: str, page: int = 1, limit: int = 25, search: Optiona
     file_path = resolve_dataset_file_path(ds["file_path"], ds["id"])
     if not file_path or not os.path.exists(file_path):
         conn.close()
+        is_cloud_path = bool(ds["file_path"] and str(ds["file_path"]).startswith("supabase://"))
+        if is_cloud_path or not is_supabase_storage_configured():
+            return {
+                "dataset": dict(ds),
+                "unlocked": False,
+                "leads": [],
+                "total_rows": ds["row_count"] or 0,
+                "page": page,
+                "current_page": page,
+                "page_size": page_size,
+                "pages_count": 1,
+                "notice": "Cloud dataset file is currently unavailable because cloud storage (Supabase Storage) is not configured or the file could not be retrieved from the bucket."
+            }
         raise HTTPException(status_code=404, detail="Data file missing.")
 
     # Parse Excel/CSV
@@ -1600,8 +1646,9 @@ def admin_upload(
     filename = f"{int(time.time())}_{file.filename}"
     file_path = os.path.join(UPLOAD_FOLDER, filename)
     
+    file_bytes = file.file.read()
     with open(file_path, "wb") as f:
-        f.write(file.file.read())
+        f.write(file_bytes)
         
     # Read file row counts and columns
     try:
@@ -1616,15 +1663,37 @@ def admin_upload(
             os.remove(file_path)
         raise HTTPException(status_code=500, detail="Error parsing file headers.")
 
+    # Supabase Cloud Storage verification
+    is_storage_ok = is_supabase_storage_configured()
+    is_testing = os.getenv("TESTING") == "1"
+
+    if not is_storage_ok and not is_testing:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(
+            status_code=503,
+            detail="Public dataset hosting requires cloud storage (Supabase Storage). Currently public dataset publication is not configured on this server."
+        )
+
+    stored_file_path = file_path
+    if is_storage_ok:
+        success, cloud_uri = upload_dataset_file(file_bytes, f"admin/{filename}")
+        if success:
+            stored_file_path = cloud_uri
+        else:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise HTTPException(status_code=502, detail=f"Failed to upload dataset to Supabase Storage: {cloud_uri}")
+
     conn = get_db()
     conn.execute(
         """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, uploaded_by)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (name, category, division, district, area, file_path, row_count, column_names, price_credits, admin_user["id"])
+        (name, category, division, district, area, stored_file_path, row_count, column_names, price_credits, admin_user["id"])
     )
     conn.commit()
     conn.close()
-    return {"success": True, "message": "Dataset catalog file uploaded successfully."}
+    return {"success": True, "message": "Dataset catalog file uploaded successfully to cloud storage."}
 
 @app.delete("/api/admin/datasets/{dataset_id}")
 def admin_delete_dataset(dataset_id: str, admin_user: dict = Depends(get_admin_user)):
@@ -2033,16 +2102,38 @@ def download_job_excel(job_id: int, request: Request, token: Optional[str] = Non
     conn = get_db()
     job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
     conn.close()
-    if not job or not job["result_path"] or not os.path.exists(job["result_path"]):
-        raise HTTPException(status_code=404, detail="Result file not found or job incomplete.")
+    if not job:
+        raise HTTPException(status_code=404, detail="Scrape job record not found.")
 
     if current_user["role"] not in ("admin", "superadmin") and job["user_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Permission denied.")
 
+    file_path = job["result_path"] if job and "result_path" in job.keys() and job["result_path"] else None
+    if file_path and not os.path.exists(file_path):
+        fn = os.path.basename(file_path.replace("\\", "/"))
+        for candidate in [
+            os.path.join(SCRAPE_RESULTS_FOLDER, fn),
+            os.path.join(os.path.dirname(__file__), "scrape_results", fn),
+            os.path.join(UPLOAD_FOLDER, fn),
+            os.path.join(os.path.dirname(__file__), "uploads", fn),
+        ]:
+            if candidate and os.path.exists(candidate):
+                file_path = candidate
+                break
+
+    if not file_path and os.path.exists(SCRAPE_RESULTS_FOLDER):
+        for fname in os.listdir(SCRAPE_RESULTS_FOLDER):
+            if f"_{job_id}." in fname or f"job_{job_id}" in fname:
+                file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fname)
+                break
+
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Result file not found or job incomplete.")
+
     sanitized_query = re.sub(r'[^a-zA-Z0-9_\-]', '_', job["query"] or "leads")
     filename = f"scraped_{sanitized_query}_job{job_id}.xlsx"
     return FileResponse(
-        job["result_path"],
+        file_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename
     )
@@ -2078,17 +2169,76 @@ def sync_dataset_to_cloud(
             detail="Cloud dataset synchronization is an exclusive feature for Pro Growth Pack and Enterprise Mega Pack users, or requires administrator authorization."
         )
 
+    # Verify Supabase Cloud Storage
+    is_storage_ok = is_supabase_storage_configured()
+    is_testing = os.getenv("TESTING") == "1"
+
+    if not is_storage_ok and not is_testing:
+        conn.close()
+        raise HTTPException(
+            status_code=503,
+            detail="Cloud dataset storage (Supabase Storage) is currently not configured on this server. Cloud synchronization is unavailable."
+        )
+
     file_rel_path = None
     if file:
         file_ext = os.path.splitext(file.filename or "")[1] or ".xlsx"
         filename = f"synced_{current_user['id']}_{int(time.time())}{file_ext}"
         os.makedirs(UPLOAD_FOLDER, exist_ok=True)
         file_disk_path = os.path.join(UPLOAD_FOLDER, filename)
+        file_bytes = file.file.read()
         with open(file_disk_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        file_rel_path = f"uploads/{filename}"
-    else:
-        file_rel_path = f"uploads/synced_placeholder_{current_user['id']}_{int(time.time())}.xlsx"
+            f.write(file_bytes)
+
+        if is_storage_ok:
+            ok, cloud_uri = upload_dataset_file(file_bytes, f"synced/{current_user['id']}/{filename}")
+            if ok:
+                file_rel_path = cloud_uri
+            else:
+                conn.close()
+                raise HTTPException(status_code=502, detail=f"Failed to upload to Supabase Storage: {cloud_uri}")
+        else:
+            file_rel_path = f"uploads/{filename}"
+    elif source_job_id:
+        # Check if local backend has the source job file on disk
+        src_job = conn.execute("SELECT result_path FROM scrape_jobs WHERE id = ?", (source_job_id,)).fetchone()
+        local_src = src_job["result_path"] if src_job and "result_path" in src_job.keys() and src_job["result_path"] else None
+        if local_src and not os.path.exists(local_src):
+            fn = os.path.basename(local_src.replace("\\", "/"))
+            for c in [
+                os.path.join(SCRAPE_RESULTS_FOLDER, fn),
+                os.path.join(os.path.dirname(__file__), "scrape_results", fn),
+                os.path.join(UPLOAD_FOLDER, fn),
+            ]:
+                if c and os.path.exists(c):
+                    local_src = c
+                    break
+        if not local_src and os.path.exists(SCRAPE_RESULTS_FOLDER):
+            for fname in os.listdir(SCRAPE_RESULTS_FOLDER):
+                if f"_{source_job_id}." in fname or f"job_{source_job_id}" in fname:
+                    local_src = os.path.join(SCRAPE_RESULTS_FOLDER, fname)
+                    break
+
+        if local_src and os.path.exists(local_src):
+            with open(local_src, "rb") as f:
+                file_bytes = f.read()
+            filename = f"synced_{current_user['id']}_{int(time.time())}.xlsx"
+            if is_storage_ok:
+                ok, cloud_uri = upload_dataset_file(file_bytes, f"synced/{current_user['id']}/{filename}")
+                if ok:
+                    file_rel_path = cloud_uri
+            if not file_rel_path:
+                file_rel_path = local_src
+
+    if not file_rel_path:
+        if is_testing:
+            file_rel_path = f"uploads/synced_placeholder_{current_user['id']}_{int(time.time())}.xlsx"
+        else:
+            conn.close()
+            raise HTTPException(
+                status_code=400,
+                detail="A valid dataset file (.xlsx or .csv) is required to sync to cloud storage. Please ensure the scrape job completed and the file exists."
+            )
 
     existing = None
     if source_job_id:
@@ -2150,15 +2300,35 @@ def submit_dataset_promotion_request(
     conn = get_db()
     is_admin = current_user.get("role") in ("admin", "superadmin")
 
+    # Verify Supabase Cloud Storage
+    is_storage_ok = is_supabase_storage_configured()
+    is_testing = os.getenv("TESTING") == "1"
+
+    if not is_storage_ok and not is_testing:
+        conn.close()
+        raise HTTPException(
+            status_code=503,
+            detail="Publishing to the public catalogue requires cloud storage (Supabase Storage). Currently public dataset hosting is not configured on this server."
+        )
+
     file_rel_path = None
     if file:
         file_ext = os.path.splitext(file.filename or "")[1] or ".xlsx"
         filename = f"promote_{current_user['id']}_{int(time.time())}{file_ext}"
         os.makedirs(UPLOAD_FOLDER, exist_ok=True)
         disk_path = os.path.join(UPLOAD_FOLDER, filename)
+        file_bytes = file.file.read()
         with open(disk_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        file_rel_path = f"uploads/{filename}"
+            f.write(file_bytes)
+        if is_storage_ok:
+            ok, cloud_uri = upload_dataset_file(file_bytes, f"promoted/{current_user['id']}/{filename}")
+            if ok:
+                file_rel_path = cloud_uri
+            else:
+                conn.close()
+                raise HTTPException(status_code=502, detail=f"Failed to upload dataset to Supabase Storage: {cloud_uri}")
+        else:
+            file_rel_path = f"uploads/{filename}"
 
     ds = None
     if dataset_id:

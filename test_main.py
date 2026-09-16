@@ -1,5 +1,6 @@
 import unittest
 import os
+os.environ["TESTING"] = "1"
 import time
 import json
 from fastapi.testclient import TestClient
@@ -408,6 +409,112 @@ class TestFullApplicationBackend(unittest.TestCase):
         self.assertEqual(data["dataset"]["name"], "Dentists in Uttara")
         self.assertTrue(data["unlocked"])
         self.assertIsInstance(data["leads"], list)
+
+    def test_21_supabase_storage_unconfigured_alert(self):
+        """Verify that when Supabase Storage is not configured and not testing, endpoints return HTTP 503 alert"""
+        from unittest.mock import patch
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        # Temporarily disable TESTING flag and mock unconfigured storage to test production alert behavior
+        old_val = os.environ.get("TESTING")
+        try:
+            if "TESTING" in os.environ:
+                del os.environ["TESTING"]
+            
+            with patch("main.is_supabase_storage_configured", return_value=False):
+                # 1. Sync endpoint should return 503
+                res_sync = client.post(
+                    "/api/datasets/sync",
+                    data={"name": "Test Leads", "category": "Leads"},
+                    headers=user_headers
+                )
+                self.assertEqual(res_sync.status_code, 503)
+                self.assertIn("Cloud dataset storage (Supabase Storage) is currently not configured", res_sync.json()["detail"])
+
+                # 2. Promotion request endpoint should return 503
+                res_promote = client.post(
+                    "/api/datasets/promote-request",
+                    data={"proposed_name": "Public Leads", "proposed_category": "General"},
+                    headers=user_headers
+                )
+                self.assertEqual(res_promote.status_code, 503)
+                self.assertIn("Publishing to the public catalogue requires cloud storage", res_promote.json()["detail"])
+        finally:
+            if old_val is not None:
+                os.environ["TESTING"] = old_val
+
+    def test_22_supabase_storage_client_mock_upload_and_download(self):
+        """Test Supabase Storage client module functions with mocked requests"""
+        from unittest.mock import patch, MagicMock
+        import supabase_storage
+
+        # Test normalize path
+        self.assertEqual(
+            supabase_storage.normalize_storage_path("supabase://datasets/synced/1/test.xlsx"),
+            "synced/1/test.xlsx"
+        )
+
+        # Mock configured environment
+        with patch.object(supabase_storage, "is_supabase_storage_configured", return_value=True):
+            with patch.object(supabase_storage, "ensure_bucket_exists", return_value=True):
+                with patch.object(supabase_storage, "get_effective_supabase_url", return_value="https://mockproj.supabase.co"):
+                    with patch("supabase_storage.requests.post") as mock_post:
+                        # Mock upload response
+                        mock_resp = MagicMock()
+                        mock_resp.status_code = 200
+                        mock_post.return_value = mock_resp
+
+                        ok, uri = supabase_storage.upload_dataset_file(b"dummy_excel_bytes", "synced/1/test.xlsx")
+                        self.assertTrue(ok)
+                        self.assertTrue(uri.startswith("supabase://"))
+
+                    with patch("supabase_storage.requests.get") as mock_get:
+                        # Mock download response
+                        mock_resp = MagicMock()
+                        mock_resp.status_code = 200
+                        mock_resp.content = b"downloaded_bytes"
+                        mock_get.return_value = mock_resp
+
+                        ok, content, err = supabase_storage.download_dataset_file("supabase://datasets/synced/1/test.xlsx")
+                        self.assertTrue(ok)
+                        self.assertEqual(content, b"downloaded_bytes")
+
+    def test_23_supabase_dataset_preview_in_table(self):
+        """Test that get_dataset retrieves and parses leads when stored in Supabase path"""
+        from unittest.mock import patch
+        import pandas as pd
+        import io
+
+        # Create a sample DataFrame in bytes
+        df_sample = pd.DataFrame([
+            {"Name": "Cloud Lead 1", "Phone": "+8801711111111", "Category": "Tech"},
+            {"Name": "Cloud Lead 2", "Phone": "+8801722222222", "Category": "Retail"}
+        ])
+        buf = io.BytesIO()
+        df_sample.to_excel(buf, index=False)
+        excel_bytes = buf.getvalue()
+
+        # Insert dataset record with supabase:// path
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO datasets (name, category, file_path, row_count, is_active, price_credits)
+               VALUES ('Supabase Cloud Test', 'Tech', 'supabase://datasets/synced/1/test_cloud.xlsx', 2, 1, 10)"""
+        )
+        ds_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        # Mock download_dataset_file to return the excel bytes
+        with patch("main.download_dataset_file", return_value=(True, excel_bytes, "")):
+            with patch("main.is_supabase_storage_configured", return_value=True):
+                admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+                res = client.get(f"/api/datasets/{ds_id}", headers=admin_headers)
+                self.assertEqual(res.status_code, 200)
+                data = res.json()
+                self.assertEqual(data["dataset"]["name"], "Supabase Cloud Test")
+                self.assertEqual(data["total_rows"], 2)
+                self.assertEqual(len(data["leads"]), 2)
+                self.assertEqual(data["leads"][0]["Name"], "Cloud Lead 1")
 
 
 if __name__ == "__main__":

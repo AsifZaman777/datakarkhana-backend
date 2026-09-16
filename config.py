@@ -17,6 +17,11 @@ if os.path.exists(_env_file):
 # ── Supabase PostgreSQL Database Configuration ────────────
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL") or os.getenv("POSTGRES_URL") or ""
 
+# ── Supabase Storage Configuration (Buckets for Datasets) ────
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or ""
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "datasets").strip()
+
 # ── Brevo & Email Configuration ───────────────────────────
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
 SMTP_USER = os.getenv("SMTP_USER", "asifdev777@gmail.com")
