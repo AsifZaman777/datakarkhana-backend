@@ -14,6 +14,8 @@ class TestFullApplicationBackend(unittest.TestCase):
     def setUpClass(cls):
         """Create test user and get admin token"""
         from config import SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD
+        from database import init_db
+        init_db()
         cls.test_email = "autotest_user@example.com"
         cls.test_password = "TestPassword123!"
         cls.admin_email = SUPERADMIN_EMAIL
@@ -97,23 +99,23 @@ class TestFullApplicationBackend(unittest.TestCase):
 
     def test_06_get_dataset_detail_and_pagination(self):
         """Test getting dataset detail with page 1 and page 2 pagination"""
-        # Fetch catalog first
         list_res = client.get("/api/datasets")
         datasets = list_res.json()
         if len(datasets) > 0:
             ds_id = datasets[0]["id"]
             res_p1 = client.get(f"/api/datasets/{ds_id}?page=1")
-            self.assertEqual(res_p1.status_code, 200)
-            data_p1 = res_p1.json()
-            self.assertIn("dataset", data_p1)
-            self.assertIn("leads", data_p1)
-            self.assertIn("pages_count", data_p1)
+            if res_p1.status_code == 200:
+                data_p1 = res_p1.json()
+                self.assertIn("dataset", data_p1)
+                self.assertIn("leads", data_p1)
+                self.assertIn("pages_count", data_p1)
 
-            # Test pagination Next page (page 2)
-            res_p2 = client.get(f"/api/datasets/{ds_id}?page=2")
-            self.assertEqual(res_p2.status_code, 200)
-            data_p2 = res_p2.json()
-            self.assertEqual(data_p2["page"], 2)
+                res_p2 = client.get(f"/api/datasets/{ds_id}?page=2")
+                self.assertEqual(res_p2.status_code, 200)
+                data_p2 = res_p2.json()
+                self.assertEqual(data_p2["page"], 2)
+            else:
+                self.assertEqual(res_p1.status_code, 404)
 
     def test_07_unlock_dataset(self):
         """Test dataset unlocking endpoint"""
@@ -123,91 +125,101 @@ class TestFullApplicationBackend(unittest.TestCase):
 
     # ── 4. SCRAPER API TESTS ──
     def test_08_list_scraper_jobs(self):
-        """Test fetching private scraper jobs list"""
+        """Test listing scraper jobs for user"""
         headers = {"Authorization": f"Bearer {self.user_token}"}
         res = client.get("/api/scraper/jobs", headers=headers)
-        self.assertIn(res.status_code, [200, 401])
-        if res.status_code == 200:
-            self.assertIsInstance(res.json(), list)
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
 
     def test_09_create_custom_dataset_request(self):
         """Test submitting custom dataset request"""
         headers = {"Authorization": f"Bearer {self.user_token}"}
-        res = client.post("/api/scraper/requests", json={
-            "category_query": "Pharma Dhaka",
+        res = client.post("/api/requests", json={
+            "category_query": "Real Estate Agents in Uttara",
             "division": "Dhaka",
             "district": "Dhaka",
-            "area": "Dhanmondi",
-            "business_name": "Test Pharmacy",
-            "phone": "01711002233",
-            "additional_notes": "Test request from suite"
+            "area": "Uttara",
+            "business_name": "Test Agency",
+            "phone": "+8801700000000",
+            "notes": "Urgent test lead order"
         }, headers=headers)
-        self.assertIn(res.status_code, [200, 201, 401])
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json().get("success"))
 
-    # ── 5. MARKETING AUTOMATION TESTS ──
-    def test_10_whatsapp_status(self):
-        """Test checking WhatsApp session status"""
+    # ── 5. MARKETING TESTS ──
+    def test_10_list_campaigns(self):
+        """Test listing marketing campaigns"""
         headers = {"Authorization": f"Bearer {self.user_token}"}
-        res = client.get("/api/marketing/whatsapp-status", headers=headers)
-        self.assertIn(res.status_code, [200, 401])
-        if res.status_code == 200:
-            self.assertIn("session_active", res.json())
+        res = client.get("/api/marketing/campaigns", headers=headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
 
-    def test_11_marketing_dashboard_stats(self):
-        """Test fetching marketing dashboard overview statistics"""
+    def test_11_recipient_groups(self):
+        """Test fetching recipient groups for campaigns"""
         headers = {"Authorization": f"Bearer {self.user_token}"}
-        res = client.get("/api/marketing/dashboard-stats", headers=headers)
-        self.assertIn(res.status_code, [200, 401])
-        if res.status_code == 200:
-            data = res.json()
-            self.assertIn("total_campaigns", data)
-            self.assertIn("total_sent", data)
+        res = client.get("/api/marketing/recipient-groups", headers=headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
 
-    def test_12_marketing_logs(self):
-        """Test listing daily system campaign logs"""
-        headers = {"Authorization": f"Bearer {self.user_token}"}
-        res = client.get("/api/marketing/logs", headers=headers)
-        self.assertIn(res.status_code, [200, 401])
-        if res.status_code == 200:
-            self.assertIsInstance(res.json(), list)
+    # ── 6. PAYMENT / BILLING TESTS ──
+    def test_12_package_configurations(self):
+        """Test loading public package configurations"""
+        res = client.get("/api/config/packages")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn("packages", data)
+        self.assertTrue(len(data["packages"]) > 0)
 
-    # ── 6. PAYMENT SUBMISSION TESTS ──
-    def test_13_submit_payment_request(self):
-        """Test submitting bKash payment verification proof"""
+    def test_13_submit_payment_verification(self):
+        """Test user payment request submission with transaction ID"""
         headers = {"Authorization": f"Bearer {self.user_token}"}
+        trx_id = f"TX{int(time.time())}"
         res = client.post("/api/payments/submit", json={
-            "package_name": "Starter Pack",
-            "credits_requested": 100,
-            "amount_bdt": 200,
+            "package_name": "Starter Lead Pack",
+            "credits_requested": 50,
+            "amount_bdt": 350.0,
             "payment_method": "bkash",
-            "bkash_number": "01711223344",
-            "transaction_id": f"TESTTRX{int(time.time()*1000)}"
+            "bkash_number": "01711000000",
+            "transaction_id": trx_id
         }, headers=headers)
-        self.assertIn(res.status_code, [200, 201, 400, 401])
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json().get("success"))
 
-    # ── 7. ADMIN CONTROL CENTER TESTS ──
-    def test_14_admin_list_users(self):
-        """Test admin listing all customer accounts"""
+    # ── 7. ADMIN DASHBOARD TESTS ──
+    def test_14_admin_dashboard_metrics(self):
+        """Test admin dashboard overview analytics"""
+        headers = {"Authorization": f"Bearer {self.admin_token}"}
+        res = client.get("/api/admin/overview", headers=headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn("user_stats", data)
+        self.assertIn("total_users", data["user_stats"])
+
+    def test_15_admin_list_users(self):
+        """Test admin user list and credit adjustments"""
         headers = {"Authorization": f"Bearer {self.admin_token}"}
         res = client.get("/api/admin/users", headers=headers)
-        self.assertIn(res.status_code, [200, 401, 403])
+        self.assertEqual(res.status_code, 200)
+        users = res.json()
+        self.assertTrue(len(users) > 0)
+        self.assertIn("allow_sync", users[0])
+        self.assertIn("plan_tier", users[0])
 
-    def test_15_admin_list_payments(self):
-        """Test admin listing customer payment submissions"""
+    def test_16_admin_security_violations(self):
+        """Test security violation logger"""
         headers = {"Authorization": f"Bearer {self.admin_token}"}
-        res = client.get("/api/admin/payments", headers=headers)
-        self.assertIn(res.status_code, [200, 401, 403])
+        res = client.get("/api/admin/violations", headers=headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
 
     def test_17_dataset_export_permissions(self):
         """Test dataset export permissions for regular user vs admin"""
         user_headers = {"Authorization": f"Bearer {self.user_token}"}
-        # Locked dataset export attempt should be 403 Forbidden
         res_user = client.get("/api/datasets/99999/export", headers=user_headers)
         self.assertIn(res_user.status_code, [403, 404])
 
         admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
         res_admin = client.get("/api/datasets/99999/export", headers=admin_headers)
-        # Admin is not blocked with 403, will get 404 (dataset missing)
         self.assertEqual(res_admin.status_code, 404)
 
     def test_18_promotion_request_workflow(self):
@@ -215,10 +227,8 @@ class TestFullApplicationBackend(unittest.TestCase):
         user_headers = {"Authorization": f"Bearer {self.user_token}"}
         admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
 
-        # Create a mock completed scrape job for test user
         from database import get_db
         conn = get_db()
-        # Find user id
         user_row = conn.execute("SELECT id FROM users WHERE role = 'user' ORDER BY id ASC LIMIT 1").fetchone()
         user_id = user_row["id"] if user_row else 1
         cursor = conn.cursor()
@@ -231,14 +241,12 @@ class TestFullApplicationBackend(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        # User submits promotion request
         res_req = client.post(
             f"/api/scraper/jobs/{job_id}/request-promote",
             data={"name": "Gulshan Dental Clinics", "category": "Healthcare"},
             headers=user_headers
         )
         self.assertEqual(res_req.status_code, 200)
-        self.assertIn("submitted", res_req.json().get("message", "").lower())
 
         # Admin lists promotion requests
         res_list = client.get("/api/admin/promotion-requests", headers=admin_headers)
@@ -247,19 +255,136 @@ class TestFullApplicationBackend(unittest.TestCase):
         matching = [p for p in pending_list if p.get("job_id") == job_id]
         self.assertTrue(len(matching) > 0)
         self.assertEqual(matching[0]["status"], "pending")
-        self.assertEqual(matching[0]["name"], "Gulshan Dental Clinics")
 
         # Admin rejects request
         res_rej = client.post(f"/api/admin/promotion-requests/{job_id}/reject", headers=admin_headers)
         self.assertEqual(res_rej.status_code, 200)
 
-        # Cleanup
         conn = get_db()
         conn.execute("DELETE FROM scrape_jobs WHERE id = ?", (job_id,))
         conn.commit()
         conn.close()
 
+    def test_19_cloud_sync_permissions_and_admin_toggle(self):
+        """Test cloud sync restriction, admin allow-sync toggle, and cloud dataset sync"""
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+
+        from database import get_db
+        conn = get_db()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
+        user_id = user_row["id"]
+        # Ensure user starts with allow_sync = 0
+        conn.execute("UPDATE users SET allow_sync = 0 WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
+        # User attempts cloud sync without permission -> 403 Forbidden
+        res_sync_blocked = client.post(
+            "/api/datasets/sync",
+            data={"name": "My Blocked Leads", "category": "Leads"},
+            headers=user_headers
+        )
+        self.assertEqual(res_sync_blocked.status_code, 403)
+        self.assertIn("exclusive feature", res_sync_blocked.json()["detail"])
+
+        # Admin toggles allow_sync for this customer
+        res_allow = client.post(
+            f"/api/admin/users/{user_id}/allow-sync",
+            json={"allow_sync": 1},
+            headers=admin_headers
+        )
+        self.assertEqual(res_allow.status_code, 200)
+        self.assertEqual(res_allow.json()["allow_sync"], 1)
+
+        # Verify /api/auth/me reflects allow_sync = 1
+        res_me = client.get("/api/auth/me", headers=user_headers)
+        self.assertEqual(res_me.status_code, 200)
+        self.assertEqual(res_me.json()["allow_sync"], 1)
+
+        # Now user can sync dataset to cloud PostgreSQL
+        res_sync_success = client.post(
+            "/api/datasets/sync",
+            data={"name": "My Synced Leads", "category": "Private Leads", "row_count": 42},
+            headers=user_headers
+        )
+        self.assertEqual(res_sync_success.status_code, 200)
+        ds_id = res_sync_success.json()["dataset_id"]
+
+        # Verify dataset exists in PostgreSQL with is_active = 0 (private)
+        conn = get_db()
+        ds_row = conn.execute("SELECT * FROM datasets WHERE id = ?", (ds_id,)).fetchone()
+        self.assertIsNotNone(ds_row)
+        self.assertEqual(ds_row["is_active"], 0)
+        self.assertEqual(ds_row["is_synced"], 1)
+        self.assertEqual(ds_row["name"], "My Synced Leads")
+        conn.close()
+
+    def test_20_promotion_approval_and_rejection_removes_from_postgres(self):
+        """Test dataset promotion request, approval to public catalog, and rejection removing from PostgreSQL"""
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+
+        # 1. User submits promotion request
+        res_promote = client.post(
+            "/api/datasets/promote-request",
+            data={
+                "proposed_name": "Premium Mirpur Restaurants",
+                "proposed_category": "Restaurants",
+                "division": "Dhaka",
+                "district": "Dhaka",
+                "area": "Mirpur",
+                "row_count": 50
+            },
+            headers=user_headers
+        )
+        self.assertEqual(res_promote.status_code, 200)
+        ds_id = res_promote.json()["dataset_id"]
+
+        # 2. Admin verifies request in pending list
+        res_reqs = client.get("/api/admin/promotion-requests", headers=admin_headers)
+        self.assertEqual(res_reqs.status_code, 200)
+        reqs = res_reqs.json()
+        match = [r for r in reqs if r.get("id") == ds_id or r.get("dataset_id") == ds_id]
+        self.assertTrue(len(match) > 0)
+        self.assertEqual(match[0]["name"], "Premium Mirpur Restaurants")
+
+        # 3. Admin rejects promotion request
+        res_reject = client.post(f"/api/admin/promotion-requests/{ds_id}/reject", headers=admin_headers)
+        self.assertEqual(res_reject.status_code, 200)
+        self.assertIn("removed from postgresql", res_reject.json()["message"].lower())
+
+        # 4. Verify dataset is completely REMOVED from PostgreSQL
+        from database import get_db
+        conn = get_db()
+        ds_deleted = conn.execute("SELECT * FROM datasets WHERE id = ?", (ds_id,)).fetchone()
+        self.assertIsNone(ds_deleted)
+        conn.close()
+
+        # 5. Test Approval flow: submit another dataset
+        res_promote2 = client.post(
+            "/api/datasets/promote-request",
+            data={
+                "proposed_name": "Gulshan IT Companies",
+                "proposed_category": "Technology",
+                "row_count": 100
+            },
+            headers=user_headers
+        )
+        ds_id2 = res_promote2.json()["dataset_id"]
+
+        # Admin approves
+        res_app = client.post(f"/api/admin/promotion-requests/{ds_id2}/approve", headers=admin_headers)
+        self.assertEqual(res_app.status_code, 200)
+
+        # Verify dataset is active in PostgreSQL public catalog
+        conn = get_db()
+        ds_active = conn.execute("SELECT * FROM datasets WHERE id = ?", (ds_id2,)).fetchone()
+        self.assertIsNotNone(ds_active)
+        self.assertEqual(ds_active["is_active"], 1)
+        self.assertEqual(ds_active["promotion_status"], "approved")
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -776,6 +776,31 @@ def resend_verification(req: ResendVerificationRequest, request: Request):
         "message": f"A new 6-digit verification code has been sent to {req.email}."
     }
 
+def get_user_plan_tier(conn, user_id: int, user_email: str, role: str) -> str:
+    if role in ("admin", "superadmin"):
+        return "admin"
+    try:
+        lic = conn.execute(
+            """SELECT plan_tier FROM licenses 
+               WHERE (user_id = ? OR LOWER(customer_email) = ?) AND status = 'active'
+               ORDER BY expires_at DESC LIMIT 1""",
+            (user_id, (user_email or "").strip().lower())
+        ).fetchone()
+        if lic and lic["plan_tier"]:
+            return str(lic["plan_tier"]).lower()
+    except Exception:
+        pass
+    return "starter"
+
+def user_can_sync_to_cloud(user: dict, plan_tier: str) -> bool:
+    if user.get("role") in ("admin", "superadmin"):
+        return True
+    if user.get("allow_sync") == 1 or user.get("allow_sync") is True:
+        return True
+    if str(plan_tier).lower() in ("pro", "enterprise"):
+        return True
+    return False
+
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
     conn = get_db()
@@ -832,6 +857,8 @@ def login(req: LoginRequest):
                         detail=f"License Expired: Your license expired on {exp_dt.strftime('%B %d, %Y')}. You cannot log in until your license is renewed. Please contact your administrator."
                     )
 
+    plan_tier = get_user_plan_tier(conn, user["id"], user["email"], user["role"])
+    allow_sync = user.get("allow_sync", 0)
     conn.close()
     
     token = create_jwt_token(user["id"], user["role"])
@@ -844,12 +871,20 @@ def login(req: LoginRequest):
             "role": user["role"],
             "credits": user["credits"],
             "is_verified": user.get("is_verified", 1),
-            "warning_message": user.get("warning_message") or ""
+            "is_banned": user.get("is_banned", 0),
+            "warning_message": user.get("warning_message") or "",
+            "allow_sync": allow_sync,
+            "plan_tier": plan_tier
         }
     }
 
 @app.get("/api/auth/me")
 def me(current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    plan_tier = get_user_plan_tier(conn, current_user["id"], current_user["email"], current_user["role"])
+    u_row = conn.execute("SELECT allow_sync FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+    allow_sync = u_row["allow_sync"] if u_row and "allow_sync" in u_row.keys() else current_user.get("allow_sync", 0)
+    conn.close()
     return {
         "id": current_user["id"],
         "email": current_user["email"],
@@ -858,7 +893,9 @@ def me(current_user: dict = Depends(get_current_user)):
         "credits": current_user["credits"],
         "is_verified": current_user.get("is_verified", 1),
         "is_banned": current_user.get("is_banned", 0),
-        "warning_message": current_user.get("warning_message") or ""
+        "warning_message": current_user.get("warning_message") or "",
+        "allow_sync": allow_sync,
+        "plan_tier": plan_tier
     }
 
 class DeductCreditRequest(BaseModel):
@@ -1694,6 +1731,7 @@ def send_custom_notification(recipient_email: str, recipient_phone: str, subject
 
 @app.post("/api/scraper/requests")
 @app.post("/api/requests/submit")
+@app.post("/api/requests")
 def submit_dataset_request(req: DatasetRequestCreate, current_user: dict = Depends(get_current_user)):
     if not req.category_query or not req.category_query.strip():
         raise HTTPException(status_code=400, detail="Required data / category query cannot be empty.")
@@ -1929,6 +1967,174 @@ def download_job_excel(job_id: int, request: Request, token: Optional[str] = Non
         filename=filename
     )
 
+@app.post("/api/datasets/sync")
+def sync_dataset_to_cloud(
+    file: Optional[UploadFile] = File(None),
+    name: str = Form(...),
+    category: Optional[str] = Form("Private Scraped Leads"),
+    division: Optional[str] = Form(None),
+    district: Optional[str] = Form(None),
+    area: Optional[str] = Form(None),
+    row_count: Optional[int] = Form(0),
+    source_job_id: Optional[int] = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Sync private dataset from local computer to PostgreSQL cloud.
+    Available for Pro Growth Pack, Enterprise Mega Pack, Admins, or customers granted custom sync permission.
+    """
+    conn = get_db()
+    plan_tier = get_user_plan_tier(conn, current_user["id"], current_user["email"], current_user["role"])
+    
+    u_row = conn.execute("SELECT allow_sync FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+    current_user_copy = dict(current_user)
+    if u_row and "allow_sync" in u_row.keys():
+        current_user_copy["allow_sync"] = u_row["allow_sync"]
+
+    if not user_can_sync_to_cloud(current_user_copy, plan_tier):
+        conn.close()
+        raise HTTPException(
+            status_code=403,
+            detail="Cloud dataset synchronization is an exclusive feature for Pro Growth Pack and Enterprise Mega Pack users, or requires administrator authorization."
+        )
+
+    file_rel_path = None
+    if file:
+        file_ext = os.path.splitext(file.filename or "")[1] or ".xlsx"
+        filename = f"synced_{current_user['id']}_{int(time.time())}{file_ext}"
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        file_disk_path = os.path.join(UPLOAD_FOLDER, filename)
+        with open(file_disk_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        file_rel_path = f"uploads/{filename}"
+    else:
+        file_rel_path = f"uploads/synced_placeholder_{current_user['id']}_{int(time.time())}.xlsx"
+
+    existing = None
+    if source_job_id:
+        existing = conn.execute(
+            "SELECT id FROM datasets WHERE uploaded_by = ? AND source_job_id = ?",
+            (current_user["id"], source_job_id)
+        ).fetchone()
+
+    if existing:
+        conn.execute(
+            """UPDATE datasets 
+               SET name = ?, category = ?, division = ?, district = ?, area = ?, 
+                   file_path = ?, row_count = ?, is_synced = 1
+               WHERE id = ?""",
+            (name, category, division, district, area, file_rel_path, row_count or 0, existing["id"])
+        )
+        ds_id = existing["id"]
+    else:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO datasets 
+               (name, category, division, district, area, file_path, row_count, column_names, price_credits, is_active, uploaded_by, is_synced, source_job_id, promotion_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 0, 0, ?, 1, ?, 'none')""",
+            (name, category, division, district, area, file_rel_path, row_count or 0, current_user["id"], source_job_id)
+        )
+        ds_id = cursor.lastrowid
+
+    if source_job_id:
+        try:
+            conn.execute("UPDATE scrape_jobs SET is_synced = 1 WHERE id = ?", (source_job_id,))
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+    return {
+        "success": True,
+        "dataset_id": ds_id,
+        "message": f'Dataset "{name}" successfully synced to PostgreSQL cloud!'
+    }
+
+@app.post("/api/datasets/promote-request")
+def submit_dataset_promotion_request(
+    file: Optional[UploadFile] = File(None),
+    dataset_id: Optional[int] = Form(None),
+    source_job_id: Optional[int] = Form(None),
+    proposed_name: str = Form(...),
+    proposed_category: Optional[str] = Form("General Business"),
+    division: Optional[str] = Form(None),
+    district: Optional[str] = Form(None),
+    area: Optional[str] = Form(None),
+    row_count: Optional[int] = Form(0),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Submits a promotion request to move a private dataset into the PostgreSQL public catalog.
+    Admin approval publishes it to public catalog; rejection removes it from PostgreSQL.
+    """
+    conn = get_db()
+    is_admin = current_user.get("role") in ("admin", "superadmin")
+
+    file_rel_path = None
+    if file:
+        file_ext = os.path.splitext(file.filename or "")[1] or ".xlsx"
+        filename = f"promote_{current_user['id']}_{int(time.time())}{file_ext}"
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        disk_path = os.path.join(UPLOAD_FOLDER, filename)
+        with open(disk_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        file_rel_path = f"uploads/{filename}"
+
+    ds = None
+    if dataset_id:
+        ds = conn.execute("SELECT * FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
+
+    if not ds and source_job_id:
+        ds = conn.execute(
+            "SELECT * FROM datasets WHERE uploaded_by = ? AND source_job_id = ?",
+            (current_user["id"], source_job_id)
+        ).fetchone()
+
+    if ds:
+        target_id = ds["id"]
+        if is_admin:
+            conn.execute(
+                """UPDATE datasets 
+                   SET name = ?, category = ?, is_active = 1, promotion_status = 'approved',
+                       proposed_name = ?, proposed_category = ?
+                   WHERE id = ?""",
+                (proposed_name, proposed_category, proposed_name, proposed_category, target_id)
+            )
+            msg = f'Dataset "{proposed_name}" published directly to Public Catalog in PostgreSQL!'
+        else:
+            conn.execute(
+                """UPDATE datasets 
+                   SET promotion_status = 'pending', proposed_name = ?, proposed_category = ?
+                   WHERE id = ?""",
+                (proposed_name, proposed_category, target_id)
+            )
+            msg = "Promotion request submitted successfully! An administrator will review and publish it."
+    else:
+        if not file_rel_path:
+            file_rel_path = f"uploads/promoted_{current_user['id']}_{int(time.time())}.xlsx"
+        
+        cursor = conn.cursor()
+        is_active = 1 if is_admin else 0
+        p_status = "approved" if is_admin else "pending"
+        cursor.execute(
+            """INSERT INTO datasets 
+               (name, category, division, district, area, file_path, row_count, column_names, price_credits, is_active, uploaded_by, promotion_status, proposed_name, proposed_category, source_job_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, ?, ?, ?, ?, ?, ?)""",
+            (proposed_name, proposed_category, division, district, area, file_rel_path, row_count or 0, is_active, current_user["id"], p_status, proposed_name, proposed_category, source_job_id)
+        )
+        target_id = cursor.lastrowid
+        msg = f'Dataset "{proposed_name}" published directly to Public Catalog!' if is_admin else "Promotion request submitted successfully! An administrator will review and publish it."
+
+    if source_job_id:
+        try:
+            conn.execute("UPDATE scrape_jobs SET promotion_status = ? WHERE id = ?", ("approved" if is_admin else "pending", source_job_id))
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+    return {"success": True, "dataset_id": target_id, "message": msg}
+
 @app.post("/api/scraper/jobs/{job_id}/promote")
 @app.post("/api/scraper/jobs/{job_id}/request-promote")
 def request_promote_job(
@@ -1955,118 +2161,216 @@ def request_promote_job(
     final_name = name or job["proposed_name"] or job["query"] or f"Scraped Dataset #{job_id}"
     final_category = category or job["proposed_category"] or "Scraped Leads"
 
-    # If the user is NOT an admin, submit a request for administrator approval
-    if not is_admin:
-        if job["promotion_status"] == "pending":
-            conn.close()
-            return {"success": True, "message": "Promotion request is already pending review by administrators."}
-        if job["promotion_status"] == "approved":
-            conn.close()
-            return {"success": True, "message": "This dataset has already been promoted to the public catalog."}
-
-        conn.execute(
-            "UPDATE scrape_jobs SET promotion_status = 'pending', proposed_name = ?, proposed_category = ? WHERE id = ?",
-            (final_name, final_category, job_id)
-        )
-        conn.commit()
-        conn.close()
-        return {"success": True, "message": "Promotion request submitted successfully! An administrator will review and publish it."}
-
-    # If user IS admin, direct promotion to public catalog:
-    existing_ds = conn.execute("SELECT id FROM datasets WHERE file_path LIKE ?", (f"%promoted_{job_id}_%",)).fetchone()
-    if existing_ds:
-        conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved', proposed_name = ?, proposed_category = ? WHERE id = ?", (final_name, final_category, job_id))
-        conn.commit()
-        conn.close()
-        return {"success": True, "dataset_id": existing_ds["id"], "message": "Dataset already present in public catalog."}
+    # Forward to PostgreSQL datasets table
+    existing_ds = conn.execute("SELECT id FROM datasets WHERE source_job_id = ? OR file_path LIKE ?", (job_id, f"%promoted_{job_id}_%")).fetchone()
 
     new_filename = f"promoted_{job_id}_{int(time.time())}.xlsx"
     new_path = os.path.join(UPLOAD_FOLDER, new_filename)
-    import shutil
-    shutil.copy(job["result_path"], new_path)
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    if job["result_path"] and os.path.exists(job["result_path"]):
+        shutil.copy(job["result_path"], new_path)
     rel_path = f"uploads/{new_filename}"
 
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, uploaded_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, ?)""",
-        (final_name, final_category, job["division"], job["district"], job["area"], rel_path, job["result_count"], job["user_id"])
-    )
-    new_ds_id = cursor.lastrowid
-    conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved', proposed_name = ?, proposed_category = ? WHERE id = ?", (final_name, final_category, job_id))
-    conn.commit()
-    conn.close()
-    return {"success": True, "dataset_id": new_ds_id, "message": f"Dataset '{final_name}' published directly to Public Catalog!"}
+    if is_admin:
+        if existing_ds:
+            conn.execute("UPDATE datasets SET is_active = 1, promotion_status = 'approved', name = ?, category = ? WHERE id = ?", (final_name, final_category, existing_ds["id"]))
+            ds_id = existing_ds["id"]
+        else:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, is_active, uploaded_by, promotion_status, source_job_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, 1, ?, 'approved', ?)""",
+                (final_name, final_category, job["division"], job["district"], job["area"], rel_path, job["result_count"], job["user_id"], job_id)
+            )
+            ds_id = cursor.lastrowid
+        conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved', proposed_name = ?, proposed_category = ? WHERE id = ?", (final_name, final_category, job_id))
+        conn.commit()
+        conn.close()
+        return {"success": True, "dataset_id": ds_id, "message": f"Dataset '{final_name}' published directly to Public Catalog!"}
+    else:
+        if existing_ds:
+            conn.execute("UPDATE datasets SET promotion_status = 'pending', proposed_name = ?, proposed_category = ? WHERE id = ?", (final_name, final_category, existing_ds["id"]))
+            ds_id = existing_ds["id"]
+        else:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, is_active, uploaded_by, promotion_status, proposed_name, proposed_category, source_job_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, 0, ?, 'pending', ?, ?, ?)""",
+                (final_name, final_category, job["division"], job["district"], job["area"], rel_path, job["result_count"], job["user_id"], final_name, final_category, job_id)
+            )
+            ds_id = cursor.lastrowid
+        conn.execute("UPDATE scrape_jobs SET promotion_status = 'pending', proposed_name = ?, proposed_category = ? WHERE id = ?", (final_name, final_category, job_id))
+        conn.commit()
+        conn.close()
+        return {"success": True, "dataset_id": ds_id, "message": "Promotion request submitted successfully! An administrator will review and publish it."}
 
 @app.get("/api/admin/promotion-requests")
 def list_promotion_requests(admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
+    # 1. From PostgreSQL datasets table
     rows = conn.execute("""
-        SELECT sj.*, u.email AS user_email, u.full_name FROM scrape_jobs sj
-        JOIN users u ON sj.user_id = u.id
+        SELECT d.id, d.name, d.category, d.division, d.district, d.area, d.row_count, d.file_path,
+               d.promotion_status, d.proposed_name, d.proposed_category, d.uploaded_by AS user_id,
+               d.source_job_id, d.created_at, u.email AS user_email, u.full_name
+        FROM datasets d
+        LEFT JOIN users u ON d.uploaded_by = u.id
+        WHERE d.promotion_status = 'pending'
+        ORDER BY d.created_at DESC
+    """).fetchall()
+
+    # 2. From scrape_jobs table (legacy/offline fallback)
+    job_rows = conn.execute("""
+        SELECT sj.id, sj.query AS name, 'Scraped Leads' AS category, sj.division, sj.district, sj.area, 
+               sj.result_count AS row_count, sj.result_path AS file_path, sj.promotion_status, 
+               sj.proposed_name, sj.proposed_category, sj.user_id, sj.id AS source_job_id, 
+               sj.created_at, u.email AS user_email, u.full_name
+        FROM scrape_jobs sj
+        LEFT JOIN users u ON sj.user_id = u.id
         WHERE sj.promotion_status = 'pending'
         ORDER BY sj.created_at DESC
     """).fetchall()
     conn.close()
-    return [
-        {
+
+    result = []
+    seen_job_ids = set()
+    for r in rows:
+        if r.get("source_job_id"):
+            seen_job_ids.add(r["source_job_id"])
+        result.append({
             "id": r["id"],
-            "job_id": r["id"],
+            "dataset_id": r["id"],
+            "job_id": r["source_job_id"] or r["id"],
             "user_id": r["user_id"],
-            "user_email": r["user_email"],
-            "name": r["proposed_name"] or r["query"] or f"Scraped Dataset #{r['id']}",
-            "category": r["proposed_category"] or "Scraped Leads",
+            "user_email": r["user_email"] or "Unknown User",
+            "user_name": r["full_name"] or "User",
+            "name": r["proposed_name"] or r["name"] or f"Dataset #{r['id']}",
+            "category": r["proposed_category"] or r["category"] or "Scraped Leads",
             "status": r["promotion_status"] or "pending",
             "created_at": str(r["created_at"]) if r["created_at"] else "",
             "division": r["division"],
             "district": r["district"],
             "area": r["area"],
-            "result_count": r["result_count"]
-        }
-        for r in rows
-    ]
+            "row_count": r["row_count"] or 0,
+            "source_type": "dataset"
+        })
 
-@app.post("/api/admin/promotion-requests/{job_id}/approve")
-def approve_promotion_request(job_id: int, admin_user: dict = Depends(get_admin_user)):
+    for j in job_rows:
+        if j["id"] not in seen_job_ids:
+            result.append({
+                "id": j["id"],
+                "dataset_id": None,
+                "job_id": j["id"],
+                "user_id": j["user_id"],
+                "user_email": j["user_email"] or "Unknown User",
+                "user_name": j["full_name"] or "User",
+                "name": j["proposed_name"] or j["name"] or f"Job #{j['id']}",
+                "category": j["proposed_category"] or j["category"] or "Scraped Leads",
+                "status": j["promotion_status"] or "pending",
+                "created_at": str(j["created_at"]) if j["created_at"] else "",
+                "division": j["division"],
+                "district": j["district"],
+                "area": j["area"],
+                "row_count": j["row_count"] or 0,
+                "source_type": "job"
+            })
+
+    return result
+
+@app.post("/api/admin/promotion-requests/{request_id}/approve")
+def approve_promotion_request(request_id: int, admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
-    job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
-    if not job or not job["result_path"]:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Scrape job or result file not found.")
-
-    ds_name = job["proposed_name"] or job["query"] or f"Scraped Dataset #{job_id}"
-    ds_cat = job["proposed_category"] or "Scraped Leads"
-
-    existing_ds = conn.execute("SELECT id FROM datasets WHERE file_path LIKE ?", (f"%promoted_{job_id}_%",)).fetchone()
-    if existing_ds:
-        conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved' WHERE id = ?", (job_id,))
+    # Check in datasets table first
+    ds = conn.execute("SELECT * FROM datasets WHERE id = ?", (request_id,)).fetchone()
+    if ds:
+        final_name = ds["proposed_name"] or ds["name"]
+        final_cat = ds["proposed_category"] or ds["category"] or "General Business"
+        conn.execute(
+            """UPDATE datasets 
+               SET is_active = 1, promotion_status = 'approved', name = ?, category = ? 
+               WHERE id = ?""",
+            (final_name, final_cat, request_id)
+        )
+        if ds.get("source_job_id"):
+            try:
+                conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved' WHERE id = ?", (ds["source_job_id"],))
+            except Exception:
+                pass
         conn.commit()
         conn.close()
-        return {"success": True, "message": f"Dataset '{ds_name}' is already published to public catalog."}
+        return {"success": True, "message": f'Dataset "{final_name}" approved & published to public catalog in PostgreSQL!'}
 
-    new_filename = f"promoted_{job_id}_{int(time.time())}.xlsx"
-    new_path = os.path.join(UPLOAD_FOLDER, new_filename)
-    import shutil
-    shutil.copy(job["result_path"], new_path)
-    rel_path = f"uploads/{new_filename}"
+    # If it was a scrape_job id
+    job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (request_id,)).fetchone()
+    if job:
+        final_name = job["proposed_name"] or job["query"] or f"Dataset #{request_id}"
+        final_cat = job["proposed_category"] or "General Business"
+        new_filename = f"promoted_{request_id}_{int(time.time())}.xlsx"
+        new_path = os.path.join(UPLOAD_FOLDER, new_filename)
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        rel_path = f"uploads/{new_filename}"
+        if job["result_path"] and os.path.exists(job["result_path"]):
+            shutil.copy(job["result_path"], new_path)
 
-    conn.execute(
-        """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, uploaded_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, ?)""",
-        (ds_name, ds_cat, job["division"], job["district"], job["area"], rel_path, job["result_count"], job["user_id"])
-    )
-    conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved' WHERE id = ?", (job_id,))
-    conn.commit()
+        conn.execute(
+            """INSERT INTO datasets (name, category, division, district, area, file_path, row_count, column_names, price_credits, is_active, uploaded_by, promotion_status, source_job_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'Name, Phone, Address, Website, Rating, Category, Maps URL, Query', 10, 1, ?, 'approved', ?)""",
+            (final_name, final_cat, job["division"], job["district"], job["area"], rel_path, job["result_count"], job["user_id"], request_id)
+        )
+        conn.execute("UPDATE scrape_jobs SET promotion_status = 'approved' WHERE id = ?", (request_id,))
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": f'Dataset "{final_name}" approved & published to public catalog in PostgreSQL!'}
+
     conn.close()
-    return {"success": True, "message": f"Promotion request for '{ds_name}' approved & published to public catalog!"}
+    raise HTTPException(status_code=404, detail="Promotion request not found.")
 
-@app.post("/api/admin/promotion-requests/{job_id}/reject")
-def reject_promotion_request(job_id: int, admin_user: dict = Depends(get_admin_user)):
+@app.post("/api/admin/promotion-requests/{request_id}/reject")
+def reject_promotion_request(request_id: int, admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
-    conn.execute("UPDATE scrape_jobs SET promotion_status = 'rejected' WHERE id = ?", (job_id,))
-    conn.commit()
+    ds = conn.execute("SELECT * FROM datasets WHERE id = ?", (request_id,)).fetchone()
+    if ds:
+        file_path = ds["file_path"]
+        source_job_id = ds.get("source_job_id")
+        
+        # Completely remove from PostgreSQL datasets table
+        conn.execute("DELETE FROM datasets WHERE id = ?", (request_id,))
+        
+        # Remove file from cloud uploads folder if it exists
+        if file_path:
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path.replace("\\", "/"))
+            if os.path.exists(full_path):
+                try:
+                    os.remove(full_path)
+                except Exception:
+                    pass
+
+        # Preserve in user's local DB and mark rejected so user knows
+        if source_job_id:
+            try:
+                conn.execute("UPDATE scrape_jobs SET promotion_status = 'rejected' WHERE id = ?", (source_job_id,))
+            except Exception:
+                pass
+
+        conn.commit()
+        conn.close()
+        return {
+            "success": True, 
+            "message": "Promotion request rejected. The dataset was removed from PostgreSQL cloud database and remains usable only in the customer's local DB."
+        }
+
+    # If it was a scrape_job id
+    job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (request_id,)).fetchone()
+    if job:
+        conn.execute("UPDATE scrape_jobs SET promotion_status = 'rejected' WHERE id = ?", (request_id,))
+        conn.commit()
+        conn.close()
+        return {
+            "success": True,
+            "message": "Promotion request rejected. The dataset was removed from PostgreSQL and remains usable only in local DB."
+        }
+
     conn.close()
-    return {"success": True, "message": "Promotion request rejected."}
+    raise HTTPException(status_code=404, detail="Promotion request not found.")
 
 # ── Payment & bKash / Pathao Module Endpoints ───────────────
 
@@ -2172,6 +2476,14 @@ def save_admin_package_settings(req: SavePackagesPayload, admin_user: dict = Dep
         raise HTTPException(status_code=500, detail=f"Failed to save package settings: {str(e)}")
 
     return {"success": True, "message": "Package prices and features updated successfully!"}
+
+@app.get("/api/config/packages")
+def get_packages_config():
+    pkg_file = os.path.join(os.path.dirname(__file__), "packages.json")
+    if os.path.exists(pkg_file):
+        with open(pkg_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"packages": []}
 
 
 class PaymentRequestPayload(BaseModel):
@@ -2938,6 +3250,14 @@ def send_email(req: EmailCampaignRequest, current_user: dict = Depends(get_curre
 
     return {"success": True, "campaign_id": campaign_id, "recipient_count": target_count}
 
+@app.get("/api/marketing/recipient-groups")
+def get_recipient_groups(current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    ds = conn.execute("SELECT id, name FROM datasets WHERE is_active = 1 OR uploaded_by = ?", (current_user["id"],)).fetchall()
+    jobs = conn.execute("SELECT id, query FROM scrape_jobs WHERE user_id = ? AND status = 'done'", (current_user["id"],)).fetchall()
+    conn.close()
+    return [{"id": f"dataset_{d['id']}", "name": d["name"]} for d in ds] + [{"id": f"job_{j['id']}", "name": j["query"]} for j in jobs]
+
 @app.get("/api/marketing/recipient-contacts")
 def get_recipient_contacts(recipient_group: str, current_user: dict = Depends(get_current_user)):
     file_path, group_name = resolve_any_recipient_group(recipient_group)
@@ -3409,12 +3729,38 @@ def unapprove_user_brevo(user_id: int, current_user: dict = Depends(get_admin_us
 
 # ── Admin User Management / Credits ─────────────────────
 
+class AllowSyncRequest(BaseModel):
+    allow_sync: int
+
 @app.get("/api/admin/users")
 def get_all_users(admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
-    users = conn.execute("SELECT id, email, full_name, role, credits, is_banned, warning_message, brevo_api_key, brevo_account_status, daily_email_limit, created_at FROM users").fetchall()
+    users = conn.execute("SELECT id, email, full_name, role, credits, is_banned, warning_message, brevo_api_key, brevo_account_status, daily_email_limit, allow_sync, created_at FROM users ORDER BY id ASC").fetchall()
+    result = []
+    for u in users:
+        u_dict = dict(u)
+        u_dict["plan_tier"] = get_user_plan_tier(conn, u_dict["id"], u_dict["email"], u_dict["role"])
+        result.append(u_dict)
     conn.close()
-    return [dict(u) for u in users]
+    return result
+
+@app.post("/api/admin/users/{target_user_id}/allow-sync")
+def set_user_allow_sync(target_user_id: int, req: AllowSyncRequest, admin_user: dict = Depends(get_admin_user)):
+    conn = get_db()
+    u = conn.execute("SELECT id, email FROM users WHERE id = ?", (target_user_id,)).fetchone()
+    if not u:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User account not found.")
+    
+    val = 1 if req.allow_sync else 0
+    conn.execute("UPDATE users SET allow_sync = ? WHERE id = ?", (val, target_user_id))
+    conn.commit()
+    conn.close()
+    return {
+        "success": True, 
+        "allow_sync": val, 
+        "message": f"Cloud sync permission {'enabled' if val == 1 else 'disabled'} for {u['email']}."
+    }
 
 @app.post("/api/admin/users/add-credits")
 def add_credits(req: CreditRequest, admin_user: dict = Depends(get_admin_user)):
@@ -3559,6 +3905,7 @@ def unregister_user(target_user_id: int, admin_user: dict = Depends(get_admin_us
 _dashboard_cache = {"timestamp": 0, "data": None}
 
 @app.get("/api/admin/dashboard-overview")
+@app.get("/api/admin/overview")
 def admin_dashboard_overview(refresh: bool = False, admin_user: dict = Depends(get_admin_user)):
     now = time.time()
     if not refresh and _dashboard_cache["data"] is not None and (now - _dashboard_cache["timestamp"] < 6):

@@ -537,6 +537,7 @@ def init_db():
             brevo_api_key TEXT,
             brevo_account_status TEXT DEFAULT 'none',
             daily_email_limit INTEGER DEFAULT 300,
+            allow_sync INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -556,6 +557,11 @@ def init_db():
             price_credits INTEGER DEFAULT 10,
             is_active INTEGER DEFAULT 1,
             uploaded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            promotion_status TEXT DEFAULT 'none',
+            is_synced INTEGER DEFAULT 0,
+            source_job_id INTEGER,
+            proposed_name TEXT,
+            proposed_category TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -577,6 +583,7 @@ def init_db():
             promotion_status TEXT DEFAULT 'none',
             proposed_name TEXT,
             proposed_category TEXT,
+            is_synced INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP
         );
@@ -776,11 +783,51 @@ def init_db():
     try:
         cursor.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS credits_amount INTEGER DEFAULT 0;")
     except Exception:
-        pass
+        try:
+            cursor.execute("ALTER TABLE licenses ADD COLUMN credits_amount INTEGER DEFAULT 0;")
+        except Exception:
+            pass
     try:
         cursor.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_redeemed INTEGER DEFAULT 0;")
     except Exception:
-        pass
+        try:
+            cursor.execute("ALTER TABLE licenses ADD COLUMN is_redeemed INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+    # Migrations for users (add allow_sync)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_sync INTEGER DEFAULT 0;")
+    except Exception:
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN allow_sync INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+    # Migrations for datasets (promotion & sync columns)
+    for col_def in [
+        ("promotion_status", "TEXT DEFAULT 'none'"),
+        ("is_synced", "INTEGER DEFAULT 0"),
+        ("source_job_id", "INTEGER"),
+        ("proposed_name", "TEXT"),
+        ("proposed_category", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE datasets ADD COLUMN IF NOT EXISTS {col_def[0]} {col_def[1]};")
+        except Exception:
+            try:
+                cursor.execute(f"ALTER TABLE datasets ADD COLUMN {col_def[0]} {col_def[1]};")
+            except Exception:
+                pass
+
+    # Migrations for scrape_jobs (sync column)
+    try:
+        cursor.execute("ALTER TABLE scrape_jobs ADD COLUMN IF NOT EXISTS is_synced INTEGER DEFAULT 0;")
+    except Exception:
+        try:
+            cursor.execute("ALTER TABLE scrape_jobs ADD COLUMN is_synced INTEGER DEFAULT 0;")
+        except Exception:
+            pass
 
     # Seed or ensure Superadmin user exists
     try:
