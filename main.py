@@ -1726,9 +1726,9 @@ def run_background_scrape(job_id, queries, division, district, area, headless=Fa
     stopped_early = False
 
     try:
-        log_cb("🚀 Initializing automated Chrome browser engine...")
-        driver = setup_driver(headless=headless)
-        log_cb("🌐 Chrome browser session established. Ready for Google Maps scraping.")
+        log_cb("🚀 Initializing automated browser engine...")
+        driver = setup_driver(headless=headless, log_cb=log_cb)
+        log_cb("🌐 Browser session active. Ready for Google Maps scraping.")
         for idx, q in enumerate(queries):
             if is_job_stopped(job_id):
                 stopped_early = True

@@ -10,6 +10,10 @@ import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
 
 SCROLL_TIMES = 10
 WAIT_TIME = 2
@@ -160,42 +164,33 @@ def clear_job_stop(job_id: int):
 
 
 
-def setup_driver(headless=True):
-    """Setup Chrome in background mode with Selenium and anti-interception protection"""
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--window-size=1400,900")
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
+def find_local_driver(driver_names: list[str]) -> str | None:
+    """Check common local paths for pre-installed or bundled driver binaries"""
+    search_dirs = [
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "drivers"),
+        os.getcwd(),
+        os.path.join(os.getcwd(), "drivers"),
+    ]
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir:
+        search_dirs.append(parent_dir)
+        search_dirs.append(os.path.join(parent_dir, "drivers"))
 
-    # Cloud Linux / Docker Chrome binary auto-discovery
-    chrome_bin = os.getenv("CHROME_BIN") or os.getenv("GOOGLE_CHROME_BIN")
-    if chrome_bin and os.path.exists(chrome_bin):
-        options.binary_location = chrome_bin
-    elif os.path.exists("/opt/render/project/.render/chrome/opt/google/chrome/google-chrome"):
-        options.binary_location = "/opt/render/project/.render/chrome/opt/google/chrome/google-chrome"
-    elif os.path.exists("/usr/bin/google-chrome"):
-        options.binary_location = "/usr/bin/google-chrome"
-    elif os.path.exists("/usr/bin/chromium-browser"):
-        options.binary_location = "/usr/bin/chromium-browser"
-    elif os.path.exists("/usr/bin/chromium"):
-        options.binary_location = "/usr/bin/chromium"
+    for s_dir in search_dirs:
+        for name in driver_names:
+            candidate = os.path.join(s_dir, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
 
-    driver = webdriver.Chrome(options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+def _apply_driver_stealth(driver):
+    """Apply CDP and JS stealth overrides to hide automation markers"""
+    try:
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    except Exception:
+        pass
 
-    # Prevent reload interception & beforeunload popups via CDP
     try:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
@@ -208,7 +203,106 @@ def setup_driver(headless=True):
     except Exception:
         pass
 
-    return driver
+def setup_driver(headless=True, log_cb=None):
+    """Setup Chrome in background mode with automatic Microsoft Edge fallback and anti-interception protection"""
+    def _log(msg: str):
+        if log_cb and callable(log_cb):
+            try:
+                log_cb(msg)
+            except Exception:
+                pass
+        else:
+            print(msg)
+
+    chrome_err = None
+    edge_err = None
+
+    # 1. Attempt Google Chrome initialization
+    try:
+        options = ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.add_argument("--window-size=1400,900")
+        options.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+
+        # Cloud Linux / Docker Chrome binary auto-discovery
+        chrome_bin = os.getenv("CHROME_BIN") or os.getenv("GOOGLE_CHROME_BIN")
+        if chrome_bin and os.path.exists(chrome_bin):
+            options.binary_location = chrome_bin
+        elif os.path.exists("/opt/render/project/.render/chrome/opt/google/chrome/google-chrome"):
+            options.binary_location = "/opt/render/project/.render/chrome/opt/google/chrome/google-chrome"
+        elif os.path.exists("/usr/bin/google-chrome"):
+            options.binary_location = "/usr/bin/google-chrome"
+        elif os.path.exists("/usr/bin/chromium-browser"):
+            options.binary_location = "/usr/bin/chromium-browser"
+        elif os.path.exists("/usr/bin/chromium"):
+            options.binary_location = "/usr/bin/chromium"
+
+        chromedriver_path = os.getenv("CHROMEDRIVER_PATH") or find_local_driver(["chromedriver.exe", "chromedriver"])
+        chrome_service = ChromeService(executable_path=chromedriver_path) if chromedriver_path and os.path.isfile(chromedriver_path) else None
+
+        driver = webdriver.Chrome(service=chrome_service, options=options) if chrome_service else webdriver.Chrome(options=options)
+        _log("🌐 Google Chrome session established successfully.")
+        _apply_driver_stealth(driver)
+        return driver
+    except Exception as ex:
+        chrome_err = ex
+        _log(f"⚠️ Google Chrome initialization failed ({ex}). Attempting Microsoft Edge fallback...")
+
+    # 2. Attempt Microsoft Edge fallback
+    try:
+        edge_options = EdgeOptions()
+        if headless:
+            edge_options.add_argument("--headless=new")
+        edge_options.add_argument("--no-sandbox")
+        edge_options.add_argument("--disable-dev-shm-usage")
+        edge_options.add_argument("--disable-gpu")
+        edge_options.add_argument("--disable-popup-blocking")
+        edge_options.add_argument("--disable-notifications")
+        edge_options.add_argument("--disable-infobars")
+        edge_options.add_argument("--disable-blink-features=AutomationControlled")
+        edge_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        edge_options.add_experimental_option("useAutomationExtension", False)
+        edge_options.add_argument("--window-size=1400,900")
+        edge_options.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+
+        edgedriver_path = os.getenv("EDGEDRIVER_PATH") or find_local_driver(["msedgedriver.exe", "msedgedriver"])
+        edge_service = EdgeService(executable_path=edgedriver_path) if edgedriver_path and os.path.isfile(edgedriver_path) else None
+
+        driver = webdriver.Edge(service=edge_service, options=edge_options) if edge_service else webdriver.Edge(options=edge_options)
+        _log("✅ Microsoft Edge session established successfully as fallback engine.")
+        _apply_driver_stealth(driver)
+        return driver
+    except Exception as ex:
+        edge_err = ex
+        _log(f"⚠️ Microsoft Edge fallback also failed ({ex}).")
+
+    # 3. Both failed: provide diagnostic message
+    err_str = f"Chrome: {chrome_err} | Edge: {edge_err}"
+    if "4551" in str(err_str) or "application control policy" in str(err_str).lower():
+        guide_msg = (
+            "Windows Application Control or Smart App Control (Error 4551) blocked browser automation binaries. "
+            "To fix: 1) Go to Windows Security > App & browser control > Smart App Control settings > turn it Off, or "
+            "2) Add an exclusion in Windows Defender for '%USERPROFILE%\\.cache\\selenium', or "
+            "3) Unblock downloaded project files using PowerShell: Get-ChildItem -Recurse | Unblock-File"
+        )
+        _log(f"🛑 Security Policy Block: {guide_msg}")
+        raise RuntimeError(guide_msg) from chrome_err
+
+    raise RuntimeError(f"Unable to initialize Chrome or Edge browser engines ({err_str})") from chrome_err
 
 def extract_phone(text):
     """Extract Bangladesh phone number from page source or elements"""

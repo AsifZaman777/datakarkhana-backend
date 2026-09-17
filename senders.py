@@ -5,7 +5,12 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.common.action_chains import ActionChains
+from scraper import find_local_driver
 from datetime import datetime
 from database import get_db
 
@@ -121,41 +126,101 @@ def fix_chrome_preferences(profile_path):
         except Exception:
             pass
 
-def setup_driver():
-    """Setup Chrome options and persistence profile directory"""
-    options = Options()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--window-size=1400,900")
-    options.add_argument("--disable-session-crashed-bubble")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--restore-last-session")
+def setup_driver(log_cb=None):
+    """Setup Chrome options (or Edge fallback) and persistence profile directory for WhatsApp"""
+    def _log(msg: str):
+        if log_cb and callable(log_cb):
+            try:
+                log_cb(msg)
+            except Exception:
+                pass
+        else:
+            print(msg)
 
     profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whatsapp_session")
     os.makedirs(profile_path, exist_ok=True)
     cleanup_profile_locks(profile_path)
     fix_chrome_preferences(profile_path)
 
-    options.add_argument(f"--user-data-dir={profile_path}")
-    options.add_argument("--profile-directory=Default")
+    chrome_err = None
+    edge_err = None
 
-    # Cloud Linux / Docker Chrome binary auto-discovery
-    chrome_bin = os.getenv("CHROME_BIN") or os.getenv("GOOGLE_CHROME_BIN")
-    if chrome_bin and os.path.exists(chrome_bin):
-        options.binary_location = chrome_bin
-    elif os.path.exists("/usr/bin/google-chrome"):
-        options.binary_location = "/usr/bin/google-chrome"
-    elif os.path.exists("/usr/bin/chromium-browser"):
-        options.binary_location = "/usr/bin/chromium-browser"
-    elif os.path.exists("/usr/bin/chromium"):
-        options.binary_location = "/usr/bin/chromium"
+    # 1. Attempt Google Chrome initialization
+    try:
+        options = ChromeOptions()
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.add_argument("--window-size=1400,900")
+        options.add_argument("--disable-session-crashed-bubble")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--restore-last-session")
+        options.add_argument(f"--user-data-dir={profile_path}")
+        options.add_argument("--profile-directory=Default")
 
-    driver = webdriver.Chrome(options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    return driver
+        # Cloud Linux / Docker Chrome binary auto-discovery
+        chrome_bin = os.getenv("CHROME_BIN") or os.getenv("GOOGLE_CHROME_BIN")
+        if chrome_bin and os.path.exists(chrome_bin):
+            options.binary_location = chrome_bin
+        elif os.path.exists("/usr/bin/google-chrome"):
+            options.binary_location = "/usr/bin/google-chrome"
+        elif os.path.exists("/usr/bin/chromium-browser"):
+            options.binary_location = "/usr/bin/chromium-browser"
+        elif os.path.exists("/usr/bin/chromium"):
+            options.binary_location = "/usr/bin/chromium"
+
+        chromedriver_path = os.getenv("CHROMEDRIVER_PATH") or find_local_driver(["chromedriver.exe", "chromedriver"])
+        chrome_service = ChromeService(executable_path=chromedriver_path) if chromedriver_path and os.path.isfile(chromedriver_path) else None
+
+        driver = webdriver.Chrome(service=chrome_service, options=options) if chrome_service else webdriver.Chrome(options=options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        _log("🌐 Google Chrome session established for WhatsApp.")
+        return driver
+    except Exception as ex:
+        chrome_err = ex
+        _log(f"⚠️ Google Chrome initialization failed for WhatsApp ({ex}). Attempting Microsoft Edge fallback...")
+
+    # 2. Attempt Microsoft Edge fallback
+    try:
+        edge_options = EdgeOptions()
+        edge_options.add_argument("--no-sandbox")
+        edge_options.add_argument("--disable-dev-shm-usage")
+        edge_options.add_argument("--disable-blink-features=AutomationControlled")
+        edge_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        edge_options.add_experimental_option("useAutomationExtension", False)
+        edge_options.add_argument("--window-size=1400,900")
+        edge_options.add_argument("--disable-session-crashed-bubble")
+        edge_options.add_argument("--disable-infobars")
+        edge_options.add_argument("--restore-last-session")
+        edge_options.add_argument(f"--user-data-dir={profile_path}")
+        edge_options.add_argument("--profile-directory=Default")
+
+        edgedriver_path = os.getenv("EDGEDRIVER_PATH") or find_local_driver(["msedgedriver.exe", "msedgedriver"])
+        edge_service = EdgeService(executable_path=edgedriver_path) if edgedriver_path and os.path.isfile(edgedriver_path) else None
+
+        driver = webdriver.Edge(service=edge_service, options=edge_options) if edge_service else webdriver.Edge(options=edge_options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        _log("✅ Microsoft Edge session established successfully as fallback for WhatsApp.")
+        return driver
+    except Exception as ex:
+        edge_err = ex
+        _log(f"⚠️ Microsoft Edge fallback also failed for WhatsApp ({ex}).")
+
+    # 3. Both failed: provide diagnostic message
+    err_str = f"Chrome: {chrome_err} | Edge: {edge_err}"
+    if "4551" in str(err_str) or "application control policy" in str(err_str).lower():
+        guide_msg = (
+            "Windows Application Control or Smart App Control (Error 4551) blocked browser automation binaries. "
+            "To fix: 1) Go to Windows Security > App & browser control > Smart App Control settings > turn it Off, or "
+            "2) Add an exclusion in Windows Defender for '%USERPROFILE%\\.cache\\selenium', or "
+            "3) Unblock downloaded project files using PowerShell: Get-ChildItem -Recurse | Unblock-File"
+        )
+        _log(f"🛑 Security Policy Block: {guide_msg}")
+        raise RuntimeError(guide_msg) from chrome_err
+
+    raise RuntimeError(f"Unable to initialize Chrome or Edge browser engines for WhatsApp ({err_str})") from chrome_err
 
 def wait_for_whatsapp_login(driver):
     """Wait for scan session verification and open active WhatsApp chats"""
@@ -365,7 +430,7 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
     close_active_setup_driver()
     driver = None
     try:
-        driver = setup_driver()
+        driver = setup_driver(log_cb=log_status)
         register_campaign_driver(campaign_id, driver)
         if not wait_for_whatsapp_login(driver):
             log_status("WhatsApp Web login verification timed out or aborted.")
