@@ -136,8 +136,24 @@ Personal-projects/datakarkhana/
 │   ├── src/lib/desktop.ts      # Desktop detection hooks (isDesktopApp)
 │   └── src/lib/hooks/          # useConnectionStatus real-time health hook
 │
-├── datakarkhana-backend/        # FastAPI / Python Local Automation Engine
-│   ├── main.py                 # API endpoints + Chromium PNA middleware
+├── datakarkhana-backend/        # FastAPI / Python Scalable Backend Engine
+│   ├── main.py                 # Slim application entrypoint (<250 lines), PNA/CORS middleware, re-exports
+│   ├── core/                   # Security, auth dependencies, constants, PNA headers
+│   │   ├── constants.py        # Path tokens (uploads, scrape_results, logs) & server uptime
+│   │   ├── security.py         # JWT tokens & Argon2/Bcrypt password hashing
+│   │   └── dependencies.py     # Auth dependencies (get_current_user, get_admin_user, plan checks)
+│   ├── schemas/                # Strongly typed Pydantic models (Auth, Datasets, Scraper, etc.)
+│   ├── services/               # Reusable business logic (Email, Scraper, Dataset, Marketing)
+│   ├── routers/                # Modular API route controllers
+│   │   ├── health.py           # Health checks & desktop downloads
+│   │   ├── auth.py             # Registration, verification, login, credits
+│   │   ├── datasets.py         # Catalog, export, sync/desync, dataset requests
+│   │   ├── scraper.py          # Scraping jobs, WebSocket live stream, CSV downloads
+│   │   ├── payments.py         # Gateways, bKash/Pathao requests, approvals
+│   │   ├── licenses.py         # Generation, activation, renewal, status
+│   │   ├── marketing.py        # WhatsApp & Email campaigns, Brevo verification
+│   │   ├── admin.py            # User management, sync quotas, bans, audit trail
+│   │   └── config.py           # Regional hierarchy & system metadata
 │   ├── database.py             # Dual-engine DB (PostgreSQL + SQLite fallback)
 │   ├── scraper.py              # Selenium Google Maps scraper engine
 │   ├── senders.py              # Selenium WhatsApp Web campaign engine

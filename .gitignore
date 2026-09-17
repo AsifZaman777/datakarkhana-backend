@@ -23,6 +23,7 @@ venv.bak/
 *.sqlite
 *.sqlite3
 databazaar.db
+.license_cache.json
 
 # Project generated directories & runtime data
 logs/

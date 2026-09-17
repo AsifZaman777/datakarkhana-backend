@@ -8,7 +8,7 @@ import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 from config import DATABASE_URL, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, SUPERADMIN_NAME
-from auth import hash_password
+from core.security import hash_password
 
 TABLES_WITH_AUTO_ID = {
     "users", "datasets", "scrape_jobs", "access_logs", "credit_transactions",
