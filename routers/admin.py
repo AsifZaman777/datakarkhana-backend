@@ -88,7 +88,7 @@ def list_promotion_requests(admin_user: dict = Depends(get_admin_user)):
                 "user_id": j["user_id"],
                 "user_email": j["user_email"] or "Unknown User",
                 "user_name": j["full_name"] or "User",
-                "name": j["proposed_name"] or j["name"] or f"Job #{j['id']}",
+                "name": j["proposed_name"] or j["name"] or j.get("query") or "Scraped Leads",
                 "category": j["proposed_category"] or j["category"] or "Scraped Leads",
                 "status": j["promotion_status"] or "pending",
                 "created_at": str(j["created_at"]) if j["created_at"] else "",
@@ -571,7 +571,7 @@ def admin_delete_user_private_dataset(user_id: int, job_id: int, admin_user: dic
     conn.execute("DELETE FROM scrape_jobs WHERE id = ?", (job_id,))
     conn.commit()
     conn.close()
-    return {"success": True, "message": f"Private dataset job #{job_id} deleted successfully."}
+    return {"success": True, "message": "Private dataset deleted successfully."}
 
 
 @router.get("/api/admin/users/{user_id}/private-datasets/{job_id}/download")

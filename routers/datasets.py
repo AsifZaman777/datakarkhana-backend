@@ -160,7 +160,7 @@ def get_dataset(dataset_id: str, page: int = 1, limit: int = 25, search: Optiona
                     file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fname)
                     break
 
-        job_name = (job["query"] if job and "query" in job.keys() and job["query"] else (synced_ds["name"] if synced_ds and "name" in synced_ds.keys() and synced_ds["name"] else f"Scrape Job #{job_real_id}"))
+        job_name = (job["query"] if job and "query" in job.keys() and job["query"] else (synced_ds["name"] if synced_ds and "name" in synced_ds.keys() and synced_ds["name"] else "Private Scraped Dataset"))
         job_div = (job["division"] if job and "division" in job.keys() else (synced_ds["division"] if synced_ds and "division" in synced_ds.keys() else "")) or ""
         job_dist = (job["district"] if job and "district" in job.keys() else (synced_ds["district"] if synced_ds and "district" in synced_ds.keys() else "")) or ""
         job_area = (job["area"] if job and "area" in job.keys() else (synced_ds["area"] if synced_ds and "area" in synced_ds.keys() else "")) or ""
