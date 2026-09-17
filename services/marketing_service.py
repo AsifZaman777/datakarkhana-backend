@@ -22,7 +22,7 @@ def resolve_any_recipient_group(recipient_group: str):
         jb = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
         if jb:
             file_path = jb["result_path"]
-            group_name = f"Scrape job: {jb['query']}"
+            group_name = jb["query"] or "Scraped Leads"
     else:
         ds = conn.execute("SELECT * FROM datasets WHERE name = ? OR id = ?", (recipient_group, recipient_group)).fetchone()
         if ds:
@@ -32,7 +32,7 @@ def resolve_any_recipient_group(recipient_group: str):
             jb = conn.execute("SELECT * FROM scrape_jobs WHERE query = ? OR id = ?", (recipient_group, recipient_group)).fetchone()
             if jb:
                 file_path = jb["result_path"]
-                group_name = f"Scrape job: {jb['query']}"
+                group_name = jb["query"] or "Scraped Leads"
     conn.close()
 
     if not file_path or not os.path.exists(file_path):

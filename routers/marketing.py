@@ -180,10 +180,11 @@ def send_whatsapp(req: WhatsAppCampaignRequest, current_user: dict = Depends(get
         conn.execute("INSERT INTO credit_transactions (user_id, amount, transaction_type, description) VALUES (?, 5, 'deduct', 'WhatsApp dispatch')", (current_user["id"],))
         
     campaign_id = f"wa_camp_{int(time.time())}"
+    target_group_name = group_name or req.recipient_group
     conn.execute(
         """INSERT INTO marketing_campaigns (id, user_id, campaign_type, recipient_group, template_preview, status, sent_count, total_count, start_row)
            VALUES (?, ?, 'whatsapp', ?, ?, 'running', ?, ?, ?)""",
-        (campaign_id, current_user["id"], req.recipient_group, req.message_template[:200], start_index, len(contacts), start_index)
+        (campaign_id, current_user["id"], target_group_name, req.message_template[:200], start_index, len(contacts), start_index)
     )
     conn.commit()
     conn.close()
@@ -240,10 +241,11 @@ def send_email(req: EmailCampaignRequest, current_user: dict = Depends(get_curre
         conn.execute("INSERT INTO credit_transactions (user_id, amount, transaction_type, description) VALUES (?, 1, 'deduct', 'Email Campaign')", (current_user["id"],))
 
     campaign_id = f"email_camp_{int(time.time())}"
+    target_group_name = group_name or req.recipient_group
     conn.execute(
         """INSERT INTO marketing_campaigns (id, user_id, campaign_type, recipient_group, template_preview, status, sent_count, total_count)
            VALUES (?, ?, 'email', ?, ?, 'done', ?, ?)""",
-        (campaign_id, current_user["id"], req.recipient_group, req.subject, target_count, target_count)
+        (campaign_id, current_user["id"], target_group_name, req.subject, target_count, target_count)
     )
     conn.execute(
         "INSERT INTO campaign_logs (campaign_id, message) VALUES (?, ?)",
