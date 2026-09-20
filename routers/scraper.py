@@ -111,6 +111,14 @@ def update_dataset_request_status(request_id: int, req: DatasetRequestStatusUpda
     return {"success": True, "message": f"Dataset request status updated to '{req.status}'!"}
 
 
+from scrapers.registry import ScraperRegistry
+
+@router.get("/api/scraper/platforms")
+def get_supported_platforms():
+    """List all supported decoupled scraping platforms and their capabilities"""
+    return ScraperRegistry.list_platforms()
+
+
 @router.post("/api/scraper/scrape")
 def trigger_scrape(
     req: ScrapeRequest,
@@ -128,6 +136,8 @@ def trigger_scrape(
     if not query_list:
         raise HTTPException(status_code=400, detail="Please provide at least one search query.")
         
+    platform = (req.platform or "google_maps").lower().strip()
+    platform_label = platform.replace("_", " ").title()
     display_query = " + ".join(query_list)
     cost = 20 * len(query_list)
     conn = get_db()
@@ -139,23 +149,35 @@ def trigger_scrape(
         conn.execute("UPDATE users SET credits = credits - ? WHERE id = ?", (cost, current_user["id"]))
         conn.execute(
             "INSERT INTO credit_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, 'deduct', ?)",
-            (current_user["id"], cost, f"Google Maps Scraper Run ({len(query_list)} queries)")
+            (current_user["id"], cost, f"{platform_label} Scraper Run ({len(query_list)} queries)")
         )
         auth_header = request.headers.get("authorization", "")
         raw_tok = auth_header.split(" ", 1)[1] if auth_header.startswith("Bearer ") else None
-        sync_credit_deduction_to_cloud(raw_tok, cost, f"Google Maps Scraper Run ({len(query_list)} queries)")
+        sync_credit_deduction_to_cloud(raw_tok, cost, f"{platform_label} Scraper Run ({len(query_list)} queries)")
     
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO scrape_jobs (user_id, query, division, district, area, status, cost_credits) VALUES (?, ?, ?, ?, ?, 'running', ?)",
-        (current_user["id"], display_query, req.division, req.district, req.area, cost)
+        "INSERT INTO scrape_jobs (user_id, query, division, district, area, status, cost_credits, platform) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
+        (current_user["id"], display_query, req.division, req.district, req.area, cost, platform)
     )
     conn.commit()
     job_id = cursor.lastrowid
     conn.close()
 
-    background_tasks.add_task(run_background_scrape, job_id, query_list, req.division, req.district, req.area, req.headless)
-    return {"success": True, "job_id": job_id}
+    background_tasks.add_task(
+        run_background_scrape,
+        job_id=job_id,
+        queries=query_list,
+        division=req.division,
+        district=req.district,
+        area=req.area,
+        headless=req.headless,
+        platform=platform,
+        credentials=req.credentials,
+        max_results=req.max_results or 50
+    )
+    return {"success": True, "job_id": job_id, "platform": platform}
+
 
 
 @router.get("/api/scraper/jobs")

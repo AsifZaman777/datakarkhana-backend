@@ -485,23 +485,36 @@ def save_to_excel(all_results, filename):
     df = pd.DataFrame(all_results)
     if "Phone" in df.columns:
         df["Phone"] = df["Phone"].astype(str).str.replace(r'\.0$', '', regex=True).replace({'nan': '', 'None': ''})
-    df = df.drop_duplicates(subset=["Name", "Phone"])
+    
+    # Deduplicate by Name & Phone or Name & Profile URL
+    dedup_cols = [c for c in ["Name", "Phone", "Profile URL"] if c in df.columns]
+    if len(dedup_cols) >= 2:
+        df = df.drop_duplicates(subset=dedup_cols[:2])
+    elif dedup_cols:
+        df = df.drop_duplicates(subset=[dedup_cols[0]])
 
     # Sort with phone numbers first
-    df["has_phone"] = df["Phone"].apply(lambda x: 0 if x else 1)
-    df = df.sort_values(["has_phone", "Name"]).drop(columns=["has_phone"])
+    if "Phone" in df.columns:
+        df["has_phone"] = df["Phone"].apply(lambda x: 0 if x else 1)
+        sort_cols = ["has_phone"]
+        if "Name" in df.columns:
+            sort_cols.append("Name")
+        df = df.sort_values(sort_cols).drop(columns=["has_phone"])
 
+    sheet_title = "Business Leads"
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Coaching Centers")
-        ws = writer.sheets["Coaching Centers"]
-
-        col_widths = {
-            "A": 35, "B": 18, "C": 40, "D": 30, "E": 10, "F": 20, "G": 50, "H": 35
-        }
-        for col, width in col_widths.items():
-            ws.column_dimensions[col].width = width
+        df.to_excel(writer, index=False, sheet_name=sheet_title)
+        ws = writer.sheets[sheet_title]
 
         from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.utils import get_column_letter
+
+        # Auto-compute or set friendly column widths
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            col_letter = get_column_letter(col_idx)
+            max_len = max([len(str(val or '')) for val in df[col_name].values[:100]] + [len(str(col_name))])
+            ws.column_dimensions[col_letter].width = min(max(max_len + 4, 15), 55)
+
         header_fill = PatternFill(start_color="0D1B3E", end_color="0D1B3E", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
         for cell in ws[1]:
@@ -510,9 +523,12 @@ def save_to_excel(all_results, filename):
             cell.alignment = Alignment(horizontal="center")
 
         green_fill = PatternFill(start_color="E1F5EE", end_color="E1F5EE", fill_type="solid")
+        phone_col_idx = list(df.columns).index("Phone") + 1 if "Phone" in df.columns else None
+
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            if row[1].value:  # has phone
+            if phone_col_idx and row[phone_col_idx - 1].value:  # has phone
                 for cell in row:
                     cell.fill = green_fill
 
     return len(df)
+

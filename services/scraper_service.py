@@ -15,7 +15,19 @@ from scraper import (
     add_job_log,
 )
 
-def run_background_scrape(job_id, queries, division, district, area, headless=False):
+from scrapers.registry import ScraperRegistry
+
+def run_background_scrape(
+    job_id,
+    queries,
+    division,
+    district,
+    area,
+    headless=False,
+    platform="google_maps",
+    credentials=None,
+    max_results=50
+):
     def log_cb(msg):
         # 1. Stream log line instantly in real-time to active WebSocket subscribers
         add_job_log(job_id, msg)
@@ -38,18 +50,36 @@ def run_background_scrape(job_id, queries, division, district, area, headless=Fa
     try:
         log_cb("🚀 Initializing automated browser engine...")
         driver = setup_driver(headless=headless, log_cb=log_cb)
-        log_cb("🌐 Browser session active. Ready for Google Maps scraping.")
+
+        # Initialize decoupled scraper from Registry
+        scraper = ScraperRegistry.get_scraper(
+            platform_id=platform,
+            driver=driver,
+            log_cb=log_cb,
+            job_id=job_id
+        )
+        log_cb(f"🌐 [{scraper.platform_name} Engine] Active session ready.")
+
+        # Authenticate if credentials supplied or required
+        if credentials or scraper.requires_auth:
+            cred_dict = credentials.model_dump() if hasattr(credentials, "model_dump") else (credentials if isinstance(credentials, dict) else {})
+            if cred_dict and (cred_dict.get("username") or cred_dict.get("password")):
+                log_cb(f"🔐 [{scraper.platform_name}] Running authentication...")
+                scraper.authenticate(cred_dict)
+            elif scraper.requires_auth:
+                log_cb(f"ℹ️ [{scraper.platform_name}] No credentials provided. Running in guest exploration mode.")
+
         for idx, q in enumerate(queries):
             if is_job_stopped(job_id):
                 stopped_early = True
                 log_cb("⏹️ Manual stop requested. Exiting scraper loop...")
                 break
 
-            log_cb(f"─── [Query {idx+1}/{len(queries)}] Searching Google Maps: '{q}' ───")
-            res = scrape_query(driver, q, log_cb, job_id=job_id)
+            log_cb(f"─── [Query {idx+1}/{len(queries)}] Searching {scraper.platform_name}: '{q}' ───")
+            res = scraper.search_and_extract(q, max_results=max_results or 50)
             if res:
                 all_results.extend(res)
-            log_cb(f"─── [Query {idx+1}/{len(queries)}] Completed: Collected {len(res) if res else 0} items ───")
+            log_cb(f"─── [Query {idx+1}/{len(queries)}] Completed: Collected {len(res) if res else 0} leads ───")
 
             if is_job_stopped(job_id):
                 stopped_early = True
