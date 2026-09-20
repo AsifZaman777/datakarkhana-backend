@@ -11,4 +11,5 @@ psycopg2-binary
 Pillow
 requests
 websockets
-
+python-calamine
+XlsxWriter
