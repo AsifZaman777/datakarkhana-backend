@@ -640,7 +640,184 @@ class TestFullApplicationBackend(unittest.TestCase):
             conn.commit()
             conn.close()
 
+    def test_29_inspect_excel_file_raw_vs_formatted(self):
+        """Test inspecting an Excel/CSV file with raw vs user-controlled formatted preview"""
+        import pandas as pd
+        import io
+
+        df = pd.DataFrame([
+            {"Name": "  Tech Corp  ", "Phone": "01711223344.0", "City": " Dhaka "},
+            {"Name": "", "Phone": "", "City": ""},  # empty row
+            {"Name": "Retail Shop", "Phone": "01822334455.0", "City": "Chittagong"}
+        ])
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+        excel_bytes = buffer.getvalue()
+
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        res = client.post(
+            "/api/datasets/inspect-file",
+            files={"file": ("test_inspect.xlsx", excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"strip_zero": "true", "trim_spaces": "true", "drop_empty_rows": "true"},
+            headers=user_headers
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["total_rows"], 2)  # dropped empty row
+        # Raw preview should preserve .0 and whitespace
+        self.assertIn("01711223344.0", str(data["raw_preview"]))
+        # Cleaned preview should have stripped .0 and trimmed whitespace
+        self.assertIn("01711223344", str(data["cleaned_preview"]))
+        self.assertNotIn("01711223344.0", str(data["cleaned_preview"]))
+
+    def test_30_upload_private_dataset_with_formatting(self):
+        """Test uploading arbitrary Excel file to private catalogue with user-controlled formatting"""
+        import pandas as pd
+        import io
+
+        df = pd.DataFrame([
+            {"Company": "Alpha Traders", "Contact": "8801912345678.0", "Category": "Wholesale"},
+            {"Company": "Beta Solutions", "Contact": "8801798765432.0", "Category": "IT"}
+        ])
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+        excel_bytes = buffer.getvalue()
+
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        res = client.post(
+            "/api/datasets/upload-private",
+            files={"file": ("sample_custom_b2b.xlsx", excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={
+                "name": "My Custom B2B Leads",
+                "category": "Corporate Directory",
+                "strip_zero": "true",
+                "trim_spaces": "true",
+                "drop_empty_rows": "true"
+            },
+            headers=user_headers
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertTrue(data["success"])
+        ds_id = data["dataset_id"]
+        self.assertEqual(data["is_synced"], 0)
+
+        # Verify dataset exists in my-private
+        res_priv = client.get("/api/datasets/my-private", headers=user_headers)
+        self.assertEqual(res_priv.status_code, 200)
+        my_ids = [d["id"] for d in res_priv.json()]
+        self.assertIn(ds_id, my_ids)
+
+        # Verify dynamic columns and formatted leads in get_dataset
+        res_detail = client.get(f"/api/datasets/{ds_id}", headers=user_headers)
+        self.assertEqual(res_detail.status_code, 200)
+        detail_data = res_detail.json()
+        self.assertIn("columns", detail_data)
+        self.assertIn("Company", detail_data["columns"])
+        self.assertIn("Contact", detail_data["columns"])
+        # Verify .0 stripped from Contact
+        self.assertEqual(detail_data["leads"][0]["Contact"], "8801912345678")
+
+    def test_31_upload_private_sync_rule_enforcement(self):
+        """Test cloud sync restriction on uploaded private dataset (blocked for starter, allowed for pro/admin)"""
+        import pandas as pd
+        import io
+
+        conn = get_db()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
+        user_id = user_row["id"]
+        # Ensure user has allow_sync = 0
+        conn.execute("UPDATE users SET allow_sync = 0 WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
+        df = pd.DataFrame([{"Lead": "Test Sync Lead", "Phone": "01700000000"}])
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+        excel_bytes = buffer.getvalue()
+
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+        res_up = client.post(
+            "/api/datasets/upload-private",
+            files={"file": ("sync_test.xlsx", excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"name": "Sync Test Dataset", "category": "General"},
+            headers=user_headers
+        )
+        self.assertEqual(res_up.status_code, 200)
+        ds_id = res_up.json()["dataset_id"]
+
+        # Attempt to sync to cloud without Pro/Enterprise/allow_sync -> 403 Forbidden
+        res_sync_blocked = client.post(
+            "/api/datasets/sync",
+            data={"dataset_id": ds_id},
+            headers=user_headers
+        )
+        self.assertEqual(res_sync_blocked.status_code, 403)
+        self.assertIn("exclusive feature", res_sync_blocked.json()["detail"])
+
+        # Enable allow_sync for user
+        conn = get_db()
+        conn.execute("UPDATE users SET allow_sync = 1 WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
+        # Now sync should succeed
+        res_sync_ok = client.post(
+            "/api/datasets/sync",
+            data={"dataset_id": ds_id},
+            headers=user_headers
+        )
+        self.assertEqual(res_sync_ok.status_code, 200)
+        self.assertTrue(res_sync_ok.json()["success"])
+
+        # Desync uploaded dataset (retains in local SQLite)
+        res_desync = client.post(f"/api/datasets/{ds_id}/desync", headers=user_headers)
+        self.assertEqual(res_desync.status_code, 200)
+
+    def test_32_promote_and_publish_uploaded_private_dataset(self):
+        """Test Admin publishing an uploaded private dataset directly to the public catalog"""
+        import pandas as pd
+        import io
+
+        df = pd.DataFrame([{"Service": "Web Development", "Contact": "01711001100"}])
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+        excel_bytes = buffer.getvalue()
+
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+        res_up = client.post(
+            "/api/datasets/upload-private",
+            files={"file": ("admin_promote_test.xlsx", excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"name": "Admin Private Draft", "category": "Services"},
+            headers=admin_headers
+        )
+        self.assertEqual(res_up.status_code, 200)
+        ds_id = res_up.json()["dataset_id"]
+
+        # Admin publishes directly to public catalog
+        res_pub = client.post(
+            f"/api/datasets/{ds_id}/publish",
+            data={"price_credits": 15, "proposed_name": "Public B2B Services"},
+            headers=admin_headers
+        )
+        self.assertEqual(res_pub.status_code, 200)
+        self.assertTrue(res_pub.json()["success"])
+
+        # Verify it is active in public datasets catalog
+        res_list = client.get("/api/datasets?search=Public B2B Services")
+        self.assertEqual(res_list.status_code, 200)
+        matching = [d for d in res_list.json() if d["id"] == ds_id]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["price_credits"], 15)
+        self.assertEqual(matching[0]["is_active"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

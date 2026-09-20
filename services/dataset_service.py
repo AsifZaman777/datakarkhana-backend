@@ -102,6 +102,126 @@ def clean_lead_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def read_raw_df_from_bytes(file_bytes: bytes, filename: str, sheet_name: Optional[str] = None):
+    """
+    Reads raw DataFrame and sheet names without applying destructive modifications.
+    """
+    buffer = io.BytesIO(file_bytes)
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+    sheet_names = []
+
+    if ext == "csv":
+        try:
+            df = pd.read_csv(buffer, dtype=str)
+        except Exception:
+            buffer.seek(0)
+            df = pd.read_csv(buffer, dtype=str, encoding="latin1")
+    else:
+        excel_file = pd.ExcelFile(buffer)
+        sheet_names = excel_file.sheet_names
+        chosen_sheet = sheet_name if sheet_name and sheet_name in sheet_names else (sheet_names[0] if sheet_names else 0)
+        df = pd.read_excel(excel_file, sheet_name=chosen_sheet, dtype=str)
+
+    return df, sheet_names
+
+
+def format_and_clean_df(
+    df: pd.DataFrame,
+    strip_zero: bool = True,
+    trim_spaces: bool = True,
+    drop_empty_rows: bool = True,
+    normalize_headers: bool = False,
+) -> pd.DataFrame:
+    """
+    Applies user-selected formatting options to a DataFrame.
+    If options are unchecked, raw data is preserved.
+    """
+    df = df.copy()
+
+    # 1. Drop completely empty rows and columns
+    if drop_empty_rows:
+        df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
+
+    # 2. Normalize headers
+    if normalize_headers:
+        new_cols = []
+        for i, c in enumerate(df.columns):
+            s = str(c).strip()
+            if not s or s.lower().startswith("unnamed:"):
+                s = f"Column_{i+1}"
+            new_cols.append(s)
+        df.columns = new_cols
+    else:
+        df.columns = [str(c) for c in df.columns]
+
+    df = df.fillna("")
+
+    # 3. Clean cells based on options
+    for col in df.columns:
+        series = df[col].astype(str)
+        series = series.apply(
+            lambda x: "" if str(x).strip().lower() in ("nan", "none", "null", "<na>", "nat") else str(x)
+        )
+        if trim_spaces:
+            series = series.str.strip()
+        if strip_zero:
+            series = series.str.replace(r'\.0$', '', regex=True)
+        df[col] = series
+
+    return df
+
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Converts a pandas DataFrame into formatted .xlsx bytes."""
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return out.getvalue()
+
+
+def inspect_excel_file(
+    file_bytes: bytes,
+    filename: str,
+    sheet_name: Optional[str] = None,
+    limit: int = 5,
+    strip_zero: bool = True,
+    trim_spaces: bool = True,
+    drop_empty_rows: bool = True,
+    normalize_headers: bool = False,
+) -> dict:
+    """
+    Returns file metadata, sheet names, and raw vs formatted preview rows
+    so user can interactively toggle checkboxes and inspect changes.
+    """
+    raw_df, sheet_names = read_raw_df_from_bytes(file_bytes, filename, sheet_name)
+    total_raw_rows = len(raw_df)
+
+    raw_preview_df = raw_df.head(limit).fillna("")
+    raw_records = [{k: str(v) for k, v in r.items()} for r in raw_preview_df.to_dict(orient="records")]
+
+    cleaned_df = format_and_clean_df(
+        raw_df,
+        strip_zero=strip_zero,
+        trim_spaces=trim_spaces,
+        drop_empty_rows=drop_empty_rows,
+        normalize_headers=normalize_headers,
+    )
+    total_cleaned_rows = len(cleaned_df)
+    cleaned_records = [{k: str(v) for k, v in r.items()} for r in cleaned_df.head(limit).to_dict(orient="records")]
+
+    return {
+        "filename": filename,
+        "sheet_names": sheet_names,
+        "selected_sheet": sheet_name or (sheet_names[0] if sheet_names else None),
+        "total_rows": total_cleaned_rows,
+        "total_raw_rows": total_raw_rows,
+        "columns": [str(c) for c in cleaned_df.columns],
+        "raw_columns": [str(c) for c in raw_df.columns],
+        "raw_preview": raw_records,
+        "cleaned_preview": cleaned_records,
+    }
+
+
 def generate_pdf_from_df(df: pd.DataFrame, title: str = "MarketingOstad Dataset Export") -> bytes:
     try:
         from reportlab.lib.pagesizes import letter, landscape
