@@ -230,7 +230,7 @@ class TestFullApplicationBackend(unittest.TestCase):
 
         from database import get_db
         conn = get_db()
-        user_row = conn.execute("SELECT id FROM users WHERE role = 'user' ORDER BY id ASC LIMIT 1").fetchone()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
         user_id = user_row["id"] if user_row else 1
         cursor = conn.cursor()
         cursor.execute(
