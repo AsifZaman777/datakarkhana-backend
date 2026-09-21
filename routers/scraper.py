@@ -362,14 +362,22 @@ def download_job_excel(job_id: int, request: Request, token: Optional[str] = Non
 
     job_dict = dict(job)
     is_daraz = (job_dict.get("scraper_type") == "daraz") or ("_daraz_" in str(job_dict.get("result_path") or ""))
-    if is_daraz and current_user["role"] not in ("admin", "superadmin"):
+    if current_user["role"] not in ("admin", "superadmin"):
         eff_perms = get_user_effective_permissions(conn, current_user)
-        if not eff_perms.get("allow_daraz_download"):
-            conn.close()
-            raise HTTPException(
-                status_code=403,
-                detail="Downloading raw Daraz Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
-            )
+        if is_daraz:
+            if not eff_perms.get("allow_daraz_download"):
+                conn.close()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Downloading raw Daraz Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
+                )
+        else:
+            if not eff_perms.get("allow_dataset_download"):
+                conn.close()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Downloading dataset spreadsheets is disabled for your subscription tier or account. You can view records directly in your Private Catalogue."
+                )
 
     conn.close()
 

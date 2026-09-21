@@ -432,14 +432,22 @@ def export_dataset(dataset_id: str, request: Request, format: Optional[str] = "e
             raise HTTPException(status_code=403, detail="Permission denied. You can only export your own scrape jobs.")
 
         is_daraz = (job and job.get("scraper_type") == "daraz") or (synced_ds and synced_ds.get("proposed_category") == "daraz_ecommerce")
-        if is_daraz and not is_admin:
+        if not is_admin:
             eff_perms = get_user_effective_permissions(conn, current_user)
-            if not eff_perms.get("allow_daraz_download"):
-                conn.close()
-                raise HTTPException(
-                    status_code=403,
-                    detail="Downloading raw Daraz Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
-                )
+            if is_daraz:
+                if not eff_perms.get("allow_daraz_download"):
+                    conn.close()
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Downloading raw Daraz Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
+                    )
+            else:
+                if not eff_perms.get("allow_dataset_download"):
+                    conn.close()
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Downloading dataset files is disabled for your subscription tier or account. You can view records directly in your Private Catalogue."
+                    )
 
         file_path = (job["result_path"] if job and job["result_path"] else (synced_ds["file_path"] if synced_ds else None))
         title_name = (job["query"] if job and job["query"] else (synced_ds["name"] if synced_ds else f"Job_{job_real_id}"))
@@ -479,6 +487,27 @@ def export_dataset(dataset_id: str, request: Request, format: Optional[str] = "e
                 status_code=403,
                 detail="Permission denied. You must unlock this dataset before downloading."
             )
+
+        if not is_admin:
+            eff_perms = get_user_effective_permissions(conn, current_user)
+            ds_name = (ds["name"] or "").lower()
+            ds_cat = (ds["category"] or "").lower() if "category" in ds.keys() and ds["category"] else ""
+            ds_prop_cat = (ds["proposed_category"] or "").lower() if "proposed_category" in ds.keys() and ds["proposed_category"] else ""
+            is_daraz = "daraz" in ds_name or "daraz" in ds_cat or "daraz" in ds_prop_cat
+            if is_daraz:
+                if not eff_perms.get("allow_daraz_download"):
+                    conn.close()
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Downloading raw Daraz Excel spreadsheets is disabled for your subscription tier. You can view all records directly in the Catalogue."
+                    )
+            else:
+                if not eff_perms.get("allow_dataset_download"):
+                    conn.close()
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Dataset file downloading is disabled for your subscription tier or account. You can view records directly in the Catalogue."
+                    )
 
         file_path = resolve_dataset_file_path(ds["file_path"], int(dataset_id))
         title_name = ds["name"]

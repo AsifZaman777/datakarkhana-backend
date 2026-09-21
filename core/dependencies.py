@@ -383,17 +383,18 @@ def get_user_effective_permissions(conn, user: dict, plan_tier: Optional[str] = 
             is_quota_overridden = True
 
     allow_dataset_download = tier_policy["allow_dataset_download"]
+    allow_daraz_download = tier_policy["allow_daraz_download"]
     is_download_overridden = False
     if user.get("allow_download") is not None:
         u_dl = user.get("allow_download")
         if u_dl in (1, True, "1"):
             allow_dataset_download = True
+            allow_daraz_download = True
             is_download_overridden = True
         elif u_dl in (0, False, "0"):
             allow_dataset_download = False
+            allow_daraz_download = False
             is_download_overridden = True
-
-    allow_daraz_download = tier_policy["allow_daraz_download"] or allow_dataset_download
 
     return {
         "tier_id": resolved_tier,
