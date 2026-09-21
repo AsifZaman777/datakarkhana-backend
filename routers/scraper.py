@@ -486,7 +486,8 @@ def get_scraper_screenshot(job_id: int, current_user: dict = Depends(get_current
     """Return the latest scraper browser screenshot as base64 (legacy fallback)"""
     frame = get_live_frame(job_id)
     if frame:
-        return {"available": True, "image": f"data:image/jpeg;base64,{frame['data']}"}
+        mime = frame.get("mime", "image/webp")
+        return {"available": True, "image": f"data:{mime};base64,{frame['data']}", "mime": mime, "engine": frame.get("engine", "cdp")}
     screenshot_path = os.path.join(SCRAPER_SCREENSHOTS_FOLDER, f"job_{job_id}.png")
     if not os.path.exists(screenshot_path):
         return {"available": False, "image": None}
@@ -544,7 +545,9 @@ async def scraper_live_stream(websocket: WebSocket, job_id: int):
         if frame and frame.get("data"):
             await websocket.send_json({
                 "type": "frame",
-                "image": frame["data"]
+                "image": frame["data"],
+                "mime": frame.get("mime", "image/webp"),
+                "engine": frame.get("engine", "cdp")
             })
 
         ping_counter = 0

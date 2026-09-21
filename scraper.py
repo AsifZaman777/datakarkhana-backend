@@ -88,38 +88,102 @@ def publish_scraper_event(job_id: int, event: dict):
             except Exception:
                 pass
 
-def push_scraper_frame(driver, job_id):
-    """Capture a compressed JPEG frame and store it in the in-memory buffer"""
-    if not job_id:
+# ── Frame throttling registry to avoid redundant CPU & WebSocket spam ──
+_LAST_FRAME_TS: dict[int, float] = {}
+_LAST_FRAME_HASH: dict[int, str] = {}
+
+def push_scraper_frame(driver, job_id, force: bool = False):
+    """Capture a high-definition, lightweight compressed frame using native Chromium/Edge CDP.
+    Falls back seamlessly to optimized PIL WebP/JPEG for non-Chromium drivers."""
+    if not job_id or not driver:
         return
     jid = int(job_id)
-    try:
-        # Get screenshot as PNG bytes from Selenium
-        png_bytes = driver.get_screenshot_as_png()
+    now = time.time()
 
-        # Compress to JPEG using Pillow for smaller frames (~20-50KB vs ~500KB PNG)
-        from PIL import Image as PILImage
-        img = PILImage.open(BytesIO(png_bytes))
+    # Throttle: at most one frame per 300ms unless forced
+    last_ts = _LAST_FRAME_TS.get(jid, 0)
+    if not force and (now - last_ts < 0.3):
+        return
 
-        # Resize to max 800px width to keep frames lightweight
-        max_width = 800
-        if img.width > max_width:
-            ratio = max_width / img.width
-            img = img.resize((max_width, int(img.height * ratio)), PILImage.LANCZOS)
+    b64_data = None
+    mime_type = "image/webp"
+    is_cdp = False
 
-        buffer = BytesIO()
-        img.save(buffer, format="JPEG", quality=40, optimize=True)
-        jpeg_bytes = buffer.getvalue()
+    # 1. Preferred path: Native Chromium/Edge CDP (Hardware-accelerated in browser C++ core)
+    if hasattr(driver, "execute_cdp_cmd"):
+        try:
+            res = driver.execute_cdp_cmd("Page.captureScreenshot", {
+                "format": "webp",
+                "quality": 75,
+                "fromSurface": True,
+            })
+            b64_data = res.get("data")
+            mime_type = "image/webp"
+            is_cdp = True
+        except Exception:
+            try:
+                res = driver.execute_cdp_cmd("Page.captureScreenshot", {
+                    "format": "jpeg",
+                    "quality": 75,
+                    "fromSurface": True,
+                })
+                b64_data = res.get("data")
+                mime_type = "image/jpeg"
+                is_cdp = True
+            except Exception:
+                b64_data = None
 
-        import base64
-        b64_data = base64.b64encode(jpeg_bytes).decode("utf-8")
-        frame_hash = hashlib.md5(jpeg_bytes).hexdigest()
+    # 2. Fallback path: Standard Selenium screenshot with optimized PIL WebP/JPEG
+    if not b64_data:
+        try:
+            png_bytes = driver.get_screenshot_as_png()
+            from PIL import Image as PILImage
+            img = PILImage.open(BytesIO(png_bytes))
 
-        with _frame_lock:
-            LIVE_FRAMES[jid] = {"data": b64_data, "hash": frame_hash}
-        publish_scraper_event(jid, {"type": "frame", "image": b64_data})
-    except Exception:
-        pass
+            # Maintain sharp 1280px resolution for crisp text
+            max_width = 1280
+            if img.width > max_width:
+                ratio = max_width / img.width
+                img = img.resize((max_width, int(img.height * ratio)), PILImage.LANCZOS)
+
+            buffer = BytesIO()
+            try:
+                img.save(buffer, format="WEBP", quality=75)
+                mime_type = "image/webp"
+            except Exception:
+                img.save(buffer, format="JPEG", quality=75, optimize=True)
+                mime_type = "image/jpeg"
+
+            import base64
+            b64_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        except Exception:
+            return
+
+    if not b64_data:
+        return
+
+    # Check hash deduplication to avoid broadcasting identical frames
+    frame_hash = hashlib.md5(b64_data[:200].encode("utf-8")).hexdigest()
+    if not force and _LAST_FRAME_HASH.get(jid) == frame_hash:
+        return
+
+    _LAST_FRAME_TS[jid] = now
+    _LAST_FRAME_HASH[jid] = frame_hash
+
+    with _frame_lock:
+        LIVE_FRAMES[jid] = {
+            "data": b64_data,
+            "hash": frame_hash,
+            "mime": mime_type,
+            "engine": "cdp" if is_cdp else "standard"
+        }
+
+    publish_scraper_event(jid, {
+        "type": "frame",
+        "image": b64_data,
+        "mime": mime_type,
+        "engine": "cdp" if is_cdp else "standard"
+    })
 
 def get_live_frame(job_id: int) -> dict | None:
     """Get the latest frame for a job (thread-safe)"""
@@ -129,7 +193,10 @@ def get_live_frame(job_id: int) -> dict | None:
         return LIVE_FRAMES.get(int(job_id))
 
 def clear_scraper_frame(job_id: int):
-    """Keep the last captured frame for user review until memory threshold is reached"""
+    """Clean up memory buffer after job completion"""
+    jid = int(job_id) if job_id else 0
+    _LAST_FRAME_TS.pop(jid, None)
+    _LAST_FRAME_HASH.pop(jid, None)
     with _frame_lock:
         if len(LIVE_FRAMES) > 25:
             try:
