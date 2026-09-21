@@ -585,6 +585,7 @@ def init_db():
             proposed_name TEXT,
             proposed_category TEXT,
             is_synced INTEGER DEFAULT 0,
+            scraper_type TEXT DEFAULT 'google_maps',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP
         );
@@ -829,12 +830,20 @@ def init_db():
             except Exception:
                 pass
 
-    # Migrations for scrape_jobs (sync column)
+    # Migrations for scrape_jobs (sync and scraper_type columns)
     try:
         cursor.execute("ALTER TABLE scrape_jobs ADD COLUMN IF NOT EXISTS is_synced INTEGER DEFAULT 0;")
     except Exception:
         try:
             cursor.execute("ALTER TABLE scrape_jobs ADD COLUMN is_synced INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+    try:
+        cursor.execute("ALTER TABLE scrape_jobs ADD COLUMN IF NOT EXISTS scraper_type TEXT DEFAULT 'google_maps';")
+    except Exception:
+        try:
+            cursor.execute("ALTER TABLE scrape_jobs ADD COLUMN scraper_type TEXT DEFAULT 'google_maps';")
         except Exception:
             pass
 

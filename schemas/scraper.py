@@ -8,3 +8,9 @@ class ScrapeRequest(BaseModel):
     district: Optional[str] = None
     area: Optional[str] = None
     headless: Optional[bool] = False
+
+class DarazScrapeRequest(BaseModel):
+    query: str
+    pages: Optional[int] = 1
+    max_items: Optional[int] = None
+    headless: Optional[bool] = True

@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import math
 import queue
 import shutil
 import base64
@@ -13,11 +14,11 @@ from fastapi.responses import FileResponse
 from database import get_db
 from core.constants import UPLOAD_FOLDER, SCRAPE_RESULTS_FOLDER, SCRAPER_SCREENSHOTS_FOLDER
 from core.security import decode_jwt_token
-from core.dependencies import get_current_user, check_desktop_license
+from core.dependencies import get_current_user, check_desktop_license, get_user_plan_tier
 from services.email_service import send_custom_notification
-from services.scraper_service import run_background_scrape
+from services.scraper_service import run_background_scrape, run_background_daraz_scrape
 from services.marketing_service import resolve_any_recipient_group
-from schemas.scraper import ScrapeRequest
+from schemas.scraper import ScrapeRequest, DarazScrapeRequest
 from schemas.datasets import DatasetRequestCreate, DatasetRequestStatusUpdate
 from scraper import (
     stop_scraper_job,
@@ -158,13 +159,92 @@ def trigger_scrape(
     return {"success": True, "job_id": job_id}
 
 
-@router.get("/api/scraper/jobs")
-def get_jobs(current_user: dict = Depends(get_current_user)):
+@router.post("/api/scraper/daraz/scrape")
+def trigger_daraz_scrape(
+    req: DarazScrapeRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    _license_valid: bool = Depends(check_desktop_license)
+):
+    query = req.query.strip() if req.query else ""
+    if not query:
+        raise HTTPException(status_code=400, detail="Please provide a valid product search query for Daraz.")
+
+    pages = max(1, req.pages or 1)
+    # 20 credits per 10 pages (1-10 pages = 20 credits, 11-20 pages = 40 credits)
+    cost = math.ceil(pages / 10.0) * 20
+
+    conn = get_db()
+    if current_user["role"] not in ("admin", "superadmin"):
+        if current_user["credits"] < cost:
+            conn.close()
+            raise HTTPException(
+                status_code=403,
+                detail=f"Insufficient credits to run Daraz scraper (requires {cost} credits for {pages} pages)."
+            )
+
+        conn.execute("UPDATE users SET credits = credits - ? WHERE id = ?", (cost, current_user["id"]))
+        conn.execute(
+            "INSERT INTO credit_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, 'deduct', ?)",
+            (current_user["id"], cost, f"Daraz Scraper Run ({pages} pages, query: '{query}')")
+        )
+        auth_header = request.headers.get("authorization", "")
+        raw_tok = auth_header.split(" ", 1)[1] if auth_header.startswith("Bearer ") else None
+        sync_credit_deduction_to_cloud(raw_tok, cost, f"Daraz Scraper Run ({pages} pages, query: '{query}')")
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO scrape_jobs (user_id, query, scraper_type, status, cost_credits) VALUES (?, ?, 'daraz', 'running', ?)",
+        (current_user["id"], query, cost)
+    )
+    conn.commit()
+    job_id = cursor.lastrowid
+    conn.close()
+
+    background_tasks.add_task(
+        run_background_daraz_scrape,
+        job_id,
+        query,
+        pages,
+        req.max_items,
+        req.headless if req.headless is not None else True
+    )
+    return {"success": True, "job_id": job_id}
+
+
+@router.get("/api/scraper/daraz/jobs")
+def get_daraz_jobs(current_user: dict = Depends(get_current_user)):
     conn = get_db()
     if current_user["role"] in ("admin", "superadmin"):
-        jobs = conn.execute("SELECT sj.*, u.email FROM scrape_jobs sj JOIN users u ON sj.user_id = u.id ORDER BY sj.created_at DESC").fetchall()
+        jobs = conn.execute(
+            "SELECT sj.*, u.email FROM scrape_jobs sj JOIN users u ON sj.user_id = u.id WHERE sj.scraper_type = 'daraz' ORDER BY sj.created_at DESC"
+        ).fetchall()
     else:
-        jobs = conn.execute("SELECT * FROM scrape_jobs WHERE user_id = ? ORDER BY created_at DESC", (current_user["id"],)).fetchall()
+        jobs = conn.execute(
+            "SELECT * FROM scrape_jobs WHERE user_id = ? AND scraper_type = 'daraz' ORDER BY created_at DESC",
+            (current_user["id"],)
+        ).fetchall()
+    conn.close()
+    return [dict(j) for j in jobs]
+
+
+@router.get("/api/scraper/jobs")
+def get_jobs(scraper_type: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    type_clause = ""
+    params = []
+    if scraper_type:
+        type_clause = "WHERE sj.scraper_type = ?" if current_user["role"] in ("admin", "superadmin") else "AND scraper_type = ?"
+        params.append(scraper_type)
+
+    if current_user["role"] in ("admin", "superadmin"):
+        query = f"SELECT sj.*, u.email FROM scrape_jobs sj JOIN users u ON sj.user_id = u.id {type_clause} ORDER BY sj.created_at DESC"
+        jobs = conn.execute(query, tuple(params) if params else None).fetchall()
+    else:
+        query = f"SELECT * FROM scrape_jobs WHERE user_id = ? {type_clause} ORDER BY created_at DESC"
+        all_params = [current_user["id"]] + params
+        jobs = conn.execute(query, tuple(all_params)).fetchall()
     conn.close()
     return [dict(j) for j in jobs]
 
@@ -232,7 +312,7 @@ def stop_scrape_job_endpoint(job_id: int, current_user: dict = Depends(get_curre
 
 @router.get("/api/scraper/jobs/{job_id}/data")
 def get_job_scraped_data(job_id: int, current_user: dict = Depends(get_current_user)):
-    """Return parsed leads data from the job's excel spreadsheet for private catalog viewing"""
+    """Return parsed leads or product data from the job's excel spreadsheet for private catalog viewing"""
     conn = get_db()
     job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
     conn.close()
@@ -242,8 +322,11 @@ def get_job_scraped_data(job_id: int, current_user: dict = Depends(get_current_u
     if current_user["role"] not in ("admin", "superadmin") and job["user_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Permission denied.")
     
+    job_dict = dict(job)
+    scraper_type = job_dict.get("scraper_type") or "google_maps"
+
     if not job["result_path"] or not os.path.exists(job["result_path"]):
-        return {"job_id": job_id, "query": job["query"], "count": 0, "data": []}
+        return {"job_id": job_id, "query": job["query"], "scraper_type": scraper_type, "count": 0, "data": []}
 
     try:
         df = pd.read_excel(job["result_path"])
@@ -252,9 +335,10 @@ def get_job_scraped_data(job_id: int, current_user: dict = Depends(get_current_u
         return {
             "job_id": job_id,
             "query": job["query"],
-            "division": job["division"],
-            "district": job["district"],
-            "area": job["area"],
+            "scraper_type": scraper_type,
+            "division": job_dict.get("division") or "",
+            "district": job_dict.get("district") or "",
+            "area": job_dict.get("area") or "",
             "count": len(records),
             "data": records
         }
@@ -264,16 +348,30 @@ def get_job_scraped_data(job_id: int, current_user: dict = Depends(get_current_u
 
 @router.get("/api/scraper/jobs/{job_id}/download")
 def download_job_excel(job_id: int, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None)):
-    """Download scraped Excel dataset file"""
+    """Download scraped Excel dataset file (restricted to Pro/Enterprise/Admin for Daraz e-commerce data)"""
     current_user = get_current_user(request=request, authorization=authorization, token=token)
     conn = get_db()
     job = conn.execute("SELECT * FROM scrape_jobs WHERE id = ?", (job_id,)).fetchone()
-    conn.close()
     if not job:
+        conn.close()
         raise HTTPException(status_code=404, detail="Scrape job record not found.")
 
     if current_user["role"] not in ("admin", "superadmin") and job["user_id"] != current_user["id"]:
+        conn.close()
         raise HTTPException(status_code=403, detail="Permission denied.")
+
+    job_dict = dict(job)
+    is_daraz = (job_dict.get("scraper_type") == "daraz") or ("_daraz_" in str(job_dict.get("result_path") or ""))
+    if is_daraz and current_user["role"] not in ("admin", "superadmin"):
+        plan_tier = get_user_plan_tier(conn, current_user["id"], current_user["email"], current_user["role"])
+        if plan_tier not in ("pro", "enterprise", "admin", "superadmin"):
+            conn.close()
+            raise HTTPException(
+                status_code=403,
+                detail="Downloading raw Daraz Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
+            )
+
+    conn.close()
 
     file_path = job["result_path"] if job and "result_path" in job.keys() and job["result_path"] else None
     if file_path and not os.path.exists(file_path):
@@ -288,15 +386,16 @@ def download_job_excel(job_id: int, request: Request, token: Optional[str] = Non
 
     if not file_path and os.path.exists(SCRAPE_RESULTS_FOLDER):
         for fname in os.listdir(SCRAPE_RESULTS_FOLDER):
-            if f"_{job_id}." in fname or f"job_{job_id}" in fname:
+            if f"_{job_id}." in fname or f"job_{job_id}" in fname or f"job_daraz_{job_id}" in fname:
                 file_path = os.path.join(SCRAPE_RESULTS_FOLDER, fname)
                 break
 
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Result file not found or job incomplete.")
 
-    sanitized_query = re.sub(r'[^a-zA-Z0-9_\-]', '_', job["query"] or "leads")
-    filename = f"scraped_{sanitized_query}_job{job_id}.xlsx"
+    sanitized_query = re.sub(r'[^a-zA-Z0-9_\-]', '_', job["query"] or "data")
+    prefix = "daraz" if is_daraz else "scraped"
+    filename = f"{prefix}_{sanitized_query}_job{job_id}.xlsx"
     return FileResponse(
         file_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
