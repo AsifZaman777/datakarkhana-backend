@@ -847,6 +847,76 @@ def init_db():
         except Exception:
             pass
 
+    # 17. Tier Permissions Table (Superadmin Access Control Matrix)
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tier_permissions (
+                tier_id TEXT PRIMARY KEY,
+                tier_name TEXT NOT NULL,
+                allow_sync INTEGER DEFAULT 1,
+                max_sync_files INTEGER DEFAULT 5,
+                allow_dataset_download INTEGER DEFAULT 1,
+                allow_daraz_download INTEGER DEFAULT 1,
+                can_use_scraper INTEGER DEFAULT 1,
+                can_use_marketing INTEGER DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+    except Exception as e:
+        print("[TIER PERMISSIONS TABLE NOTICE]", e)
+
+    # Seed default tier permission policies
+    tier_defaults = [
+        ("starter", "Starter Pack", 0, 0, 0, 0, 1, 0),
+        ("pro", "Pro Growth Pack", 1, 5, 1, 1, 1, 1),
+        ("enterprise", "Enterprise Mega Pack", 1, 25, 1, 1, 1, 1),
+    ]
+    for tid, tname, async_val, max_files, ds_dl, daraz_dl, scraper, mktg in tier_defaults:
+        try:
+            cursor.execute("""
+                INSERT INTO tier_permissions (tier_id, tier_name, allow_sync, max_sync_files, allow_dataset_download, allow_daraz_download, can_use_scraper, can_use_marketing)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (tier_id) DO NOTHING;
+            """, (tid, tname, async_val, max_files, ds_dl, daraz_dl, scraper, mktg))
+        except Exception:
+            try:
+                cursor.execute("""
+                    INSERT OR IGNORE INTO tier_permissions (tier_id, tier_name, allow_sync, max_sync_files, allow_dataset_download, allow_daraz_download, can_use_scraper, can_use_marketing)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """, (tid, tname, async_val, max_files, ds_dl, daraz_dl, scraper, mktg))
+            except Exception:
+                pass
+
+    # Migration for users: allow_download column (user-level override)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_download INTEGER DEFAULT NULL;")
+    except Exception:
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN allow_download INTEGER DEFAULT NULL;")
+        except Exception:
+            pass
+
+    # Data Migration: normalize plan_tier in licenses & auto-configure allow_sync for Pro/Enterprise users
+    try:
+        cursor.execute("UPDATE licenses SET plan_tier = 'enterprise' WHERE LOWER(plan_tier) LIKE '%enterprise%';")
+        cursor.execute("UPDATE licenses SET plan_tier = 'pro' WHERE LOWER(plan_tier) LIKE '%pro%' AND LOWER(plan_tier) NOT LIKE '%enterprise%';")
+        cursor.execute("UPDATE licenses SET plan_tier = 'starter' WHERE LOWER(plan_tier) LIKE '%starter%';")
+        
+        cursor.execute("""
+            UPDATE users 
+            SET allow_sync = 1, 
+                max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < 5 THEN 5 ELSE max_sync_files END
+            WHERE id IN (
+                SELECT DISTINCT user_id FROM licenses 
+                WHERE status = 'active' AND (LOWER(plan_tier) = 'pro' OR LOWER(plan_tier) = 'enterprise')
+                UNION
+                SELECT DISTINCT user_id FROM payment_requests 
+                WHERE status = 'approved' AND (LOWER(package_name) LIKE '%pro%' OR LOWER(package_name) LIKE '%enterprise%')
+            ) AND id IS NOT NULL;
+        """)
+    except Exception as e:
+        print("[MIGRATION NOTICE]", e)
+
     # Seed or ensure Superadmin user exists
     try:
         pwd_hash = hash_password(SUPERADMIN_PASSWORD)

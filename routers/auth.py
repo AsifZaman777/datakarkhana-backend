@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from database import get_db, is_sqlite_active
 from core.security import hash_password, verify_password, create_jwt_token, decode_jwt_token
-from core.dependencies import get_current_user, get_user_plan_tier
+from core.dependencies import get_current_user, get_user_plan_tier, get_user_effective_permissions, normalize_plan_tier
 from services.email_service import generate_otp, send_free_verification_email
 from schemas.auth import (
     RegisterRequest,
@@ -227,6 +227,21 @@ def login(req: LoginRequest):
 
     plan_tier = get_user_plan_tier(conn, user["id"], user["email"], user["role"])
     allow_sync = user.get("allow_sync", 0)
+
+    # Auto-configure allow_sync for Pro/Enterprise users upon login
+    if plan_tier in ("pro", "enterprise") and allow_sync != 1:
+        conn.execute("""
+            UPDATE users 
+            SET allow_sync = 1,
+                max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < 5 THEN 5 ELSE max_sync_files END
+            WHERE id = ?
+        """, (user["id"],))
+        conn.commit()
+        allow_sync = 1
+
+    user_dict = dict(user)
+    user_dict["allow_sync"] = allow_sync
+    effective_perms = get_user_effective_permissions(conn, user_dict, plan_tier)
     conn.close()
     
     token = create_jwt_token(user["id"], user["role"])
@@ -242,7 +257,8 @@ def login(req: LoginRequest):
             "is_banned": user.get("is_banned", 0),
             "warning_message": user.get("warning_message") or "",
             "allow_sync": allow_sync,
-            "plan_tier": plan_tier
+            "plan_tier": plan_tier,
+            "effective_permissions": effective_perms
         }
     }
 
@@ -251,9 +267,27 @@ def login(req: LoginRequest):
 def me(current_user: dict = Depends(get_current_user)):
     conn = get_db()
     plan_tier = get_user_plan_tier(conn, current_user["id"], current_user["email"], current_user["role"])
-    u_row = conn.execute("SELECT allow_sync FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+    u_row = conn.execute("SELECT allow_sync, max_sync_files, allow_download FROM users WHERE id = ?", (current_user["id"],)).fetchone()
     allow_sync = u_row["allow_sync"] if u_row and "allow_sync" in u_row.keys() else current_user.get("allow_sync", 0)
+
+    if plan_tier in ("pro", "enterprise") and allow_sync != 1:
+        conn.execute("""
+            UPDATE users 
+            SET allow_sync = 1,
+                max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < 5 THEN 5 ELSE max_sync_files END
+            WHERE id = ?
+        """, (current_user["id"],))
+        conn.commit()
+        allow_sync = 1
+
+    user_copy = dict(current_user)
+    user_copy["allow_sync"] = allow_sync
+    if u_row:
+        user_copy["max_sync_files"] = u_row["max_sync_files"]
+        user_copy["allow_download"] = u_row["allow_download"]
+    effective_perms = get_user_effective_permissions(conn, user_copy, plan_tier)
     conn.close()
+
     return {
         "id": current_user["id"],
         "email": current_user["email"],
@@ -264,7 +298,8 @@ def me(current_user: dict = Depends(get_current_user)):
         "is_banned": current_user.get("is_banned", 0),
         "warning_message": current_user.get("warning_message") or "",
         "allow_sync": allow_sync,
-        "plan_tier": plan_tier
+        "plan_tier": plan_tier,
+        "effective_permissions": effective_perms
     }
 
 

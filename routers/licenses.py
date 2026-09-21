@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from database import get_db
 from core.security import verify_password, create_jwt_token
-from core.dependencies import get_admin_user, get_current_user, get_optional_current_user
+from core.dependencies import get_admin_user, get_current_user, get_optional_current_user, normalize_plan_tier, get_tier_permissions
 from license_service import generate_production_license, get_current_license_status, verify_license
 from schemas.licenses import (
     AdminGenerateLicensePayload,
@@ -69,6 +69,7 @@ def admin_generate_license(payload: AdminGenerateLicensePayload, admin_user: dic
         if matched_user:
             user_id = matched_user["id"]
 
+    norm_tier = normalize_plan_tier(payload.plan_tier or "pro")
     license_info = generate_production_license(
         customer_name=payload.customer_name,
         customer_email=cust_email,
@@ -76,9 +77,27 @@ def admin_generate_license(payload: AdminGenerateLicensePayload, admin_user: dic
         expires_at_str=payload.expires_at,
         user_id=user_id,
         custom_key=payload.custom_key,
-        plan_tier=payload.plan_tier or "pro",
+        plan_tier=norm_tier,
         credits_amount=payload.credits_amount or 0
     )
+
+    if user_id and norm_tier in ("pro", "enterprise"):
+        try:
+            conn2 = get_db()
+            tier_perm = get_tier_permissions(conn2, norm_tier)
+            target_quota = tier_perm.get("max_sync_files", 5)
+            conn2.execute(
+                """UPDATE users 
+                   SET allow_sync = 1,
+                       max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < ? THEN ? ELSE max_sync_files END
+                   WHERE id = ?""",
+                (target_quota, target_quota, user_id)
+            )
+            conn2.commit()
+            conn2.close()
+        except Exception:
+            pass
+
     return {"success": True, "license": license_info}
 
 
@@ -239,6 +258,20 @@ def activate_license_endpoint(payload: ActivateLicensePayload, current_user: dic
         """, (current_user["id"], current_user["email"], lic_dict["id"]))
         conn.commit()
 
+        # Automatically configure sync and dataset permissions for Pro/Enterprise tier users
+        norm_tier = normalize_plan_tier(lic_dict.get("plan_tier"))
+        tier_perm = get_tier_permissions(conn, norm_tier)
+        if norm_tier in ("pro", "enterprise") or tier_perm.get("allow_sync"):
+            target_quota = tier_perm.get("max_sync_files", 5)
+            conn.execute(
+                """UPDATE users 
+                   SET allow_sync = 1,
+                       max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < ? THEN ? ELSE max_sync_files END
+                   WHERE id = ?""",
+                (target_quota, target_quota, current_user["id"])
+            )
+            conn.commit()
+
         u_row = conn.execute("SELECT credits FROM users WHERE id = ?", (current_user["id"],)).fetchone()
         if u_row:
             new_balance = u_row["credits"]
@@ -246,6 +279,19 @@ def activate_license_endpoint(payload: ActivateLicensePayload, current_user: dic
         # Already redeemed: ensure linked to current user
         if not lic_dict.get("user_id"):
             conn.execute("UPDATE licenses SET user_id = ?, customer_email = ? WHERE id = ?", (current_user["id"], current_user["email"], lic_dict["id"]))
+            conn.commit()
+
+        norm_tier = normalize_plan_tier(lic_dict.get("plan_tier"))
+        tier_perm = get_tier_permissions(conn, norm_tier)
+        if norm_tier in ("pro", "enterprise") or tier_perm.get("allow_sync"):
+            target_quota = tier_perm.get("max_sync_files", 5)
+            conn.execute(
+                """UPDATE users 
+                   SET allow_sync = 1,
+                       max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < ? THEN ? ELSE max_sync_files END
+                   WHERE id = ?""",
+                (target_quota, target_quota, current_user["id"])
+            )
             conn.commit()
 
     conn.close()

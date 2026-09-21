@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from database import get_db
 from core.constants import UPLOAD_FOLDER, SCRAPE_RESULTS_FOLDER, SCRAPER_SCREENSHOTS_FOLDER
 from core.security import decode_jwt_token
-from core.dependencies import get_current_user, check_desktop_license, get_user_plan_tier
+from core.dependencies import get_current_user, check_desktop_license, get_user_plan_tier, get_user_effective_permissions
 from services.email_service import send_custom_notification
 from services.scraper_service import run_background_scrape, run_background_daraz_scrape
 from services.marketing_service import resolve_any_recipient_group
@@ -363,8 +363,8 @@ def download_job_excel(job_id: int, request: Request, token: Optional[str] = Non
     job_dict = dict(job)
     is_daraz = (job_dict.get("scraper_type") == "daraz") or ("_daraz_" in str(job_dict.get("result_path") or ""))
     if is_daraz and current_user["role"] not in ("admin", "superadmin"):
-        plan_tier = get_user_plan_tier(conn, current_user["id"], current_user["email"], current_user["role"])
-        if plan_tier not in ("pro", "enterprise", "admin", "superadmin"):
+        eff_perms = get_user_effective_permissions(conn, current_user)
+        if not eff_perms.get("allow_daraz_download"):
             conn.close()
             raise HTTPException(
                 status_code=403,

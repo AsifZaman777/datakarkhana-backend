@@ -19,4 +19,7 @@ from .dependencies import (
     check_desktop_license,
     get_user_plan_tier,
     user_can_sync_to_cloud,
+    normalize_plan_tier,
+    get_tier_permissions,
+    get_user_effective_permissions,
 )

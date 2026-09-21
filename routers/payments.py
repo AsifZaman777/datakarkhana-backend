@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Form, UploadFile, File
 
 from database import get_db
 from core.constants import UPLOAD_FOLDER
-from core.dependencies import get_current_user, get_admin_user
+from core.dependencies import get_current_user, get_admin_user, normalize_plan_tier, get_tier_permissions
 from services.email_service import send_license_key_email
 from license_service import generate_production_license
 from schemas.payments import (
@@ -199,6 +199,7 @@ def approve_payment_request(
 
     credits_amount = req["credits_requested"]
     plan_name = req["package_name"] or "Pro"
+    tier = normalize_plan_tier(plan_name)
 
     expiry_days = (payload.expiry_days if payload and payload.expiry_days else 30)
     expires_at_val = (payload.expires_at if payload else None)
@@ -212,7 +213,7 @@ def approve_payment_request(
         user_id=req["user_id"],
         payment_request_id=request_id,
         custom_key=custom_key_val,
-        plan_tier=plan_name.lower(),
+        plan_tier=tier,
         credits_amount=credits_amount
     )
 
@@ -223,6 +224,19 @@ def approve_payment_request(
            WHERE id = ?""",
         (now_str, admin_user["id"], license_info["production_key"], license_info["expires_at"], request_id)
     )
+
+    # Automatically configure sync and dataset permissions for Pro/Enterprise tier users
+    tier_perm = get_tier_permissions(conn, tier)
+    if tier in ("pro", "enterprise") or tier_perm.get("allow_sync"):
+        target_quota = tier_perm.get("max_sync_files", 5)
+        conn.execute(
+            """UPDATE users 
+               SET allow_sync = 1,
+                   max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < ? THEN ? ELSE max_sync_files END
+               WHERE id = ?""",
+            (target_quota, target_quota, req["user_id"])
+        )
+
     conn.commit()
     conn.close()
 

@@ -194,27 +194,229 @@ def check_desktop_license(current_user: dict = Depends(get_current_user)):
             )
     return True
 
+def normalize_plan_tier(val: Optional[str]) -> str:
+    """Normalizes package names or plan strings to standard tier keys (starter, pro, enterprise, admin)"""
+    if not val:
+        return "starter"
+    v = str(val).strip().lower()
+    if "superadmin" in v or "admin" in v:
+        return "admin"
+    if "enterprise" in v:
+        return "enterprise"
+    if "pro" in v:
+        return "pro"
+    if "starter" in v:
+        return "starter"
+    return v
+
+
+def get_tier_permissions(conn, tier_id: str) -> dict:
+    """Fetches access permissions for a specific tier from tier_permissions table with fallbacks."""
+    normalized = normalize_plan_tier(tier_id)
+    default_map = {
+        "starter": {
+            "tier_id": "starter",
+            "tier_name": "Starter Pack",
+            "allow_sync": False,
+            "max_sync_files": 0,
+            "allow_dataset_download": False,
+            "allow_daraz_download": False,
+            "can_use_scraper": True,
+            "can_use_marketing": False
+        },
+        "pro": {
+            "tier_id": "pro",
+            "tier_name": "Pro Growth Pack",
+            "allow_sync": True,
+            "max_sync_files": 5,
+            "allow_dataset_download": True,
+            "allow_daraz_download": True,
+            "can_use_scraper": True,
+            "can_use_marketing": True
+        },
+        "enterprise": {
+            "tier_id": "enterprise",
+            "tier_name": "Enterprise Mega Pack",
+            "allow_sync": True,
+            "max_sync_files": 25,
+            "allow_dataset_download": True,
+            "allow_daraz_download": True,
+            "can_use_scraper": True,
+            "can_use_marketing": True
+        },
+        "admin": {
+            "tier_id": "admin",
+            "tier_name": "Super Admin",
+            "allow_sync": True,
+            "max_sync_files": 999,
+            "allow_dataset_download": True,
+            "allow_daraz_download": True,
+            "can_use_scraper": True,
+            "can_use_marketing": True
+        }
+    }
+
+    if not conn:
+        return default_map.get(normalized, default_map["starter"])
+
+    try:
+        row = conn.execute(
+            "SELECT * FROM tier_permissions WHERE tier_id = ? OR tier_id = ?",
+            (tier_id, normalized)
+        ).fetchone()
+        if row:
+            r = dict(row)
+            return {
+                "tier_id": r.get("tier_id") or normalized,
+                "tier_name": r.get("tier_name") or tier_id.capitalize(),
+                "allow_sync": bool(r.get("allow_sync", 1)),
+                "max_sync_files": int(r.get("max_sync_files", 5)),
+                "allow_dataset_download": bool(r.get("allow_dataset_download", 1)),
+                "allow_daraz_download": bool(r.get("allow_daraz_download", 1)),
+                "can_use_scraper": bool(r.get("can_use_scraper", 1)),
+                "can_use_marketing": bool(r.get("can_use_marketing", 1)),
+                "updated_at": str(r.get("updated_at") or "")
+            }
+    except Exception:
+        pass
+
+    return default_map.get(normalized, default_map["starter"])
+
+
 def get_user_plan_tier(conn, user_id: int, user_email: str, role: str) -> str:
+    """
+    Resolves the plan tier of a user.
+    Prioritizes admin roles -> active licenses -> approved payment requests -> starter.
+    Normalizes pack names (e.g. 'Enterprise Mega Pack' -> 'enterprise').
+    """
     if role in ("admin", "superadmin"):
         return "admin"
     try:
-        lic = conn.execute(
-            """SELECT plan_tier FROM licenses 
+        clean_email = (user_email or "").strip().lower()
+
+        # 1. Check active licenses
+        lics = conn.execute(
+            """SELECT plan_tier, expires_at FROM licenses 
                WHERE (user_id = ? OR LOWER(customer_email) = ?) AND status = 'active'
-               ORDER BY expires_at DESC LIMIT 1""",
-            (user_id, (user_email or "").strip().lower())
-        ).fetchone()
-        if lic and lic["plan_tier"]:
-            return str(lic["plan_tier"]).lower()
+               ORDER BY expires_at DESC""",
+            (user_id, clean_email)
+        ).fetchall()
+        for lic in lics:
+            t = normalize_plan_tier(lic["plan_tier"])
+            if t == "enterprise":
+                return "enterprise"
+        for lic in lics:
+            t = normalize_plan_tier(lic["plan_tier"])
+            if t == "pro":
+                return "pro"
+
+        # 2. Check approved payment requests
+        pays = conn.execute(
+            """SELECT package_name FROM payment_requests 
+               WHERE user_id = ? AND status = 'approved'
+               ORDER BY id DESC""",
+            (user_id,)
+        ).fetchall()
+        for pay in pays:
+            t = normalize_plan_tier(pay["package_name"])
+            if t == "enterprise":
+                return "enterprise"
+        for pay in pays:
+            t = normalize_plan_tier(pay["package_name"])
+            if t == "pro":
+                return "pro"
+
+        # Check other active licenses if custom tier
+        if lics and lics[0]["plan_tier"]:
+            return normalize_plan_tier(lics[0]["plan_tier"])
     except Exception:
         pass
     return "starter"
 
+
+def get_user_effective_permissions(conn, user: dict, plan_tier: Optional[str] = None) -> dict:
+    """
+    Evaluates effective permissions for a user by merging tier policy defaults
+    with user-level manual overrides (e.g. allow_sync, max_sync_files, allow_download).
+    """
+    role = user.get("role", "user")
+    if role in ("admin", "superadmin"):
+        return {
+            "tier_id": "admin",
+            "tier_name": "Admin / Superadmin",
+            "allow_sync": True,
+            "max_sync_files": 999,
+            "allow_dataset_download": True,
+            "allow_daraz_download": True,
+            "can_use_scraper": True,
+            "can_use_marketing": True,
+            "is_sync_overridden": False,
+            "is_download_overridden": False,
+            "is_quota_overridden": False
+        }
+
+    resolved_tier = plan_tier or get_user_plan_tier(conn, user.get("id", 0), user.get("email", ""), role)
+    tier_policy = get_tier_permissions(conn, resolved_tier)
+
+    # Check user-level overrides
+    allow_sync = tier_policy["allow_sync"]
+    is_sync_overridden = False
+    if user.get("allow_sync") is not None:
+        u_val = user.get("allow_sync")
+        if u_val in (1, True, "1"):
+            allow_sync = True
+            is_sync_overridden = not tier_policy["allow_sync"]
+        elif u_val in (0, False, "0"):
+            # If user purchased pro/enterprise, their tier policy grants allow_sync unless explicitly disabled
+            if resolved_tier in ("pro", "enterprise"):
+                allow_sync = True
+            else:
+                allow_sync = False
+                is_sync_overridden = tier_policy["allow_sync"]
+
+    max_sync_files = tier_policy["max_sync_files"]
+    is_quota_overridden = False
+    if user.get("max_sync_files") is not None:
+        u_max = int(user.get("max_sync_files"))
+        if u_max != tier_policy["max_sync_files"]:
+            max_sync_files = u_max
+            is_quota_overridden = True
+
+    allow_dataset_download = tier_policy["allow_dataset_download"]
+    is_download_overridden = False
+    if user.get("allow_download") is not None:
+        u_dl = user.get("allow_download")
+        if u_dl in (1, True, "1"):
+            allow_dataset_download = True
+            is_download_overridden = True
+        elif u_dl in (0, False, "0"):
+            allow_dataset_download = False
+            is_download_overridden = True
+
+    allow_daraz_download = tier_policy["allow_daraz_download"] or allow_dataset_download
+
+    return {
+        "tier_id": resolved_tier,
+        "tier_name": tier_policy.get("tier_name", resolved_tier.capitalize()),
+        "allow_sync": allow_sync,
+        "max_sync_files": max_sync_files,
+        "allow_dataset_download": allow_dataset_download,
+        "allow_daraz_download": allow_daraz_download,
+        "can_use_scraper": tier_policy["can_use_scraper"],
+        "can_use_marketing": tier_policy["can_use_marketing"],
+        "is_sync_overridden": is_sync_overridden,
+        "is_download_overridden": is_download_overridden,
+        "is_quota_overridden": is_quota_overridden
+    }
+
+
 def user_can_sync_to_cloud(user: dict, plan_tier: str) -> bool:
+    """Checks whether a user is allowed to sync datasets to the cloud."""
     if user.get("role") in ("admin", "superadmin"):
         return True
-    if user.get("allow_sync") == 1 or user.get("allow_sync") is True:
+    if user.get("allow_sync") in (1, True, "1"):
         return True
-    if str(plan_tier).lower() in ("pro", "enterprise"):
+    norm = normalize_plan_tier(plan_tier)
+    if norm in ("pro", "enterprise"):
         return True
     return False

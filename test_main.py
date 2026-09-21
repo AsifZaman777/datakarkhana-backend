@@ -816,6 +816,68 @@ class TestFullApplicationBackend(unittest.TestCase):
         self.assertEqual(matching[0]["price_credits"], 15)
         self.assertEqual(matching[0]["is_active"], 1)
 
+    def test_33_tier_access_control_and_user_overrides(self):
+        """Test Superadmin Tier Permissions Matrix and User-Level Overrides"""
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+        user_headers = {"Authorization": f"Bearer {self.user_token}"}
+
+        # 1. Superadmin fetches tier permissions matrix
+        res_matrix = client.get("/api/admin/tier-permissions", headers=admin_headers)
+        self.assertEqual(res_matrix.status_code, 200)
+        tiers = res_matrix.json()
+        tier_ids = [t["tier_id"] for t in tiers]
+        self.assertIn("starter", tier_ids)
+        self.assertIn("pro", tier_ids)
+        self.assertIn("enterprise", tier_ids)
+
+        # 2. Superadmin updates tier permissions (e.g. adjust pro quota to 8 and save)
+        pro_tier = next(t for t in tiers if t["tier_id"] == "pro")
+        pro_tier["max_sync_files"] = 8
+        res_save = client.post(
+            "/api/admin/tier-permissions",
+            json={"tiers": tiers, "apply_to_existing_users": False},
+            headers=admin_headers
+        )
+        self.assertEqual(res_save.status_code, 200)
+        self.assertTrue(res_save.json()["success"])
+
+        # 3. Superadmin sets user-level override on test user
+        from database import get_db
+        conn = get_db()
+        user_row = conn.execute("SELECT id FROM users WHERE email = ?", (self.test_email,)).fetchone()
+        user_id = user_row["id"]
+        conn.close()
+
+        res_override = client.post(
+            f"/api/admin/users/{user_id}/permissions",
+            json={"allow_sync": 1, "max_sync_files": 12, "allow_download": 1},
+            headers=admin_headers
+        )
+        self.assertEqual(res_override.status_code, 200)
+        eff = res_override.json()["effective_permissions"]
+        self.assertTrue(eff["allow_sync"])
+        self.assertEqual(eff["max_sync_files"], 12)
+        self.assertTrue(eff["allow_dataset_download"])
+
+    def test_34_auto_configuration_pro_enterprise_and_tier_resolution(self):
+        """Test automatic permission configuration and tier resolution for Pro/Enterprise users"""
+        admin_headers = {"Authorization": f"Bearer {self.admin_token}"}
+
+        # Query all users via admin endpoint
+        res_users = client.get("/api/admin/users", headers=admin_headers)
+        self.assertEqual(res_users.status_code, 200)
+        users = res_users.json()
+
+        # Verify plan_tier and purchased_package fields exist on all user objects
+        for u in users:
+            self.assertIn("plan_tier", u)
+            self.assertIn("purchased_package", u)
+            self.assertIn("effective_permissions", u)
+            # If user has Pro or Enterprise tier, verify allow_sync is automatically 1
+            if u["plan_tier"] in ("pro", "enterprise"):
+                self.assertEqual(u["allow_sync"], 1)
+                self.assertGreaterEqual(u["max_sync_files"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

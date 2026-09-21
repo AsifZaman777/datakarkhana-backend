@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import shutil
 from typing import Optional, List, Dict, Any
@@ -8,7 +9,13 @@ from fastapi.responses import FileResponse
 
 from database import get_db
 from core.constants import UPLOAD_FOLDER
-from core.dependencies import get_admin_user, get_user_plan_tier
+from core.dependencies import (
+    get_admin_user,
+    get_user_plan_tier,
+    normalize_plan_tier,
+    get_tier_permissions,
+    get_user_effective_permissions,
+)
 from supabase_storage import is_supabase_storage_configured, get_bucket_name, get_effective_supabase_url
 from schemas.admin import (
     CreditRequest,
@@ -17,6 +24,9 @@ from schemas.admin import (
     UploadLimitRequest,
     BanRequest,
     AdminWarningRequest,
+    TierPermissionItem,
+    SaveTierPermissionsRequest,
+    UserPermissionOverrideRequest,
 )
 from schemas.marketing import (
     BrevoApproveRequest,
@@ -311,20 +321,201 @@ def unapprove_user_brevo(user_id: int, current_user: dict = Depends(get_admin_us
 @router.get("/api/admin/users")
 def get_all_users(admin_user: dict = Depends(get_admin_user)):
     conn = get_db()
-    users = conn.execute("SELECT id, email, full_name, role, credits, is_banned, warning_message, brevo_api_key, brevo_account_status, daily_email_limit, allow_sync, max_sync_files, created_at FROM users ORDER BY id ASC").fetchall()
+    users = conn.execute("SELECT id, email, full_name, role, credits, is_banned, warning_message, brevo_api_key, brevo_account_status, daily_email_limit, allow_sync, max_sync_files, allow_download, created_at FROM users ORDER BY id ASC").fetchall()
     result = []
+    has_updates = False
     for u in users:
         u_dict = dict(u)
-        u_dict["plan_tier"] = get_user_plan_tier(conn, u_dict["id"], u_dict["email"], u_dict["role"])
-        u_dict["max_sync_files"] = u_dict.get("max_sync_files") if u_dict.get("max_sync_files") is not None else 5
+        tier = get_user_plan_tier(conn, u_dict["id"], u_dict["email"], u_dict["role"])
+        u_dict["plan_tier"] = tier
+
+        # Lookup purchased package name
+        pkg_row = conn.execute(
+            "SELECT package_name FROM payment_requests WHERE user_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
+            (u_dict["id"],)
+        ).fetchone()
+        u_dict["purchased_package"] = pkg_row["package_name"] if pkg_row else None
+
+        # Auto-configure allow_sync for Pro/Enterprise users
+        if tier in ("pro", "enterprise"):
+            if u_dict.get("allow_sync") != 1 or u_dict.get("max_sync_files") is None or u_dict.get("max_sync_files") < 5:
+                conn.execute("""
+                    UPDATE users 
+                    SET allow_sync = 1,
+                        max_sync_files = CASE WHEN max_sync_files IS NULL OR max_sync_files < 5 THEN 5 ELSE max_sync_files END
+                    WHERE id = ?
+                """, (u_dict["id"],))
+                u_dict["allow_sync"] = 1
+                u_dict["max_sync_files"] = max(u_dict.get("max_sync_files") or 5, 5)
+                has_updates = True
+        else:
+            u_dict["max_sync_files"] = u_dict.get("max_sync_files") if u_dict.get("max_sync_files") is not None else 5
+
+        # Calculate effective permissions (tier defaults + user overrides)
+        u_dict["effective_permissions"] = get_user_effective_permissions(conn, u_dict, tier)
+
         count_row = conn.execute(
             "SELECT COUNT(*) as cnt FROM datasets WHERE uploaded_by = ? AND (is_synced = 1 OR file_path LIKE ?)",
             (u_dict["id"], "supabase://%")
         ).fetchone()
         u_dict["synced_files_count"] = count_row["cnt"] if count_row else 0
         result.append(u_dict)
+
+    if has_updates:
+        conn.commit()
     conn.close()
     return result
+
+
+@router.get("/api/admin/tier-permissions")
+def get_all_tier_permissions(admin_user: dict = Depends(get_admin_user)):
+    """Returns access control permissions for all plan tiers (starter, pro, enterprise + dynamic packages)"""
+    conn = get_db()
+    # Read packages from packages.json to register any newly configured packages
+    pkg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages.json")
+    custom_packages = []
+    if os.path.exists(pkg_file):
+        try:
+            with open(pkg_file, "r", encoding="utf-8") as f:
+                pdata = json.load(f)
+                custom_packages = pdata.get("packages", [])
+        except Exception:
+            pass
+
+    for pkg in custom_packages:
+        pid = pkg.get("id")
+        pname = pkg.get("name")
+        if pid and pname:
+            norm_id = normalize_plan_tier(pid)
+            tier_key = norm_id if norm_id in ("starter", "pro", "enterprise") else pid
+            is_pro_ent = "enterprise" in pid.lower() or "pro" in pid.lower()
+            try:
+                conn.execute("""
+                    INSERT INTO tier_permissions (tier_id, tier_name, allow_sync, max_sync_files, allow_dataset_download, allow_daraz_download, can_use_scraper, can_use_marketing)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (tier_id) DO NOTHING
+                """, (
+                    tier_key,
+                    pname,
+                    1 if is_pro_ent else 0,
+                    25 if "enterprise" in pid.lower() else (5 if "pro" in pid.lower() else 0),
+                    1 if is_pro_ent else 0,
+                    1 if is_pro_ent else 0,
+                    1,
+                    1 if is_pro_ent else 0
+                ))
+            except Exception:
+                pass
+    conn.commit()
+
+    rows = conn.execute("SELECT * FROM tier_permissions ORDER BY tier_id ASC").fetchall()
+    
+    # Calculate user count per tier
+    all_users = conn.execute("SELECT id, email, role FROM users").fetchall()
+    tier_user_counts = {}
+    for u in all_users:
+        t = get_user_plan_tier(conn, u["id"], u["email"], u["role"])
+        tier_user_counts[t] = tier_user_counts.get(t, 0) + 1
+
+    result = []
+    for r in rows:
+        r_dict = dict(r)
+        tid = r_dict["tier_id"]
+        r_dict["allow_sync"] = bool(r_dict.get("allow_sync", 1))
+        r_dict["allow_dataset_download"] = bool(r_dict.get("allow_dataset_download", 1))
+        r_dict["allow_daraz_download"] = bool(r_dict.get("allow_daraz_download", 1))
+        r_dict["can_use_scraper"] = bool(r_dict.get("can_use_scraper", 1))
+        r_dict["can_use_marketing"] = bool(r_dict.get("can_use_marketing", 1))
+        r_dict["user_count"] = tier_user_counts.get(tid, 0)
+        result.append(r_dict)
+
+    conn.close()
+    return result
+
+
+@router.post("/api/admin/tier-permissions")
+def save_tier_permissions(req: SaveTierPermissionsRequest, admin_user: dict = Depends(get_admin_user)):
+    """Super Admin endpoint to configure tier-level access controls and optionally push to all subscribers."""
+    conn = get_db()
+    for item in req.tiers:
+        conn.execute("""
+            INSERT INTO tier_permissions (tier_id, tier_name, allow_sync, max_sync_files, allow_dataset_download, allow_daraz_download, can_use_scraper, can_use_marketing, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (tier_id) DO UPDATE SET
+                tier_name = EXCLUDED.tier_name,
+                allow_sync = EXCLUDED.allow_sync,
+                max_sync_files = EXCLUDED.max_sync_files,
+                allow_dataset_download = EXCLUDED.allow_dataset_download,
+                allow_daraz_download = EXCLUDED.allow_daraz_download,
+                can_use_scraper = EXCLUDED.can_use_scraper,
+                can_use_marketing = EXCLUDED.can_use_marketing,
+                updated_at = CURRENT_TIMESTAMP
+        """, (
+            item.tier_id,
+            item.tier_name,
+            1 if item.allow_sync else 0,
+            item.max_sync_files,
+            1 if item.allow_dataset_download else 0,
+            1 if item.allow_daraz_download else 0,
+            1 if item.can_use_scraper else 0,
+            1 if item.can_use_marketing else 0
+        ))
+
+        # Push defaults to existing users on this tier if requested
+        if req.apply_to_existing_users:
+            all_users = conn.execute("SELECT id, email, role FROM users").fetchall()
+            for u in all_users:
+                t = get_user_plan_tier(conn, u["id"], u["email"], u["role"])
+                if t == item.tier_id or normalize_plan_tier(t) == normalize_plan_tier(item.tier_id):
+                    conn.execute(
+                        "UPDATE users SET allow_sync = ?, max_sync_files = ? WHERE id = ?",
+                        (1 if item.allow_sync else 0, item.max_sync_files, u["id"])
+                    )
+
+    conn.commit()
+    conn.close()
+    return {"success": True, "message": "Tier access permissions updated successfully."}
+
+
+@router.post("/api/admin/users/{target_user_id}/permissions")
+def set_user_permissions_override(
+    target_user_id: int,
+    req: UserPermissionOverrideRequest,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Super Admin endpoint to configure user-level custom permission overrides."""
+    conn = get_db()
+    u = conn.execute("SELECT id, email, role FROM users WHERE id = ?", (target_user_id,)).fetchone()
+    if not u:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    updates = []
+    params = []
+    if req.allow_sync is not None:
+        updates.append("allow_sync = ?")
+        params.append(1 if req.allow_sync else 0)
+    if req.max_sync_files is not None:
+        updates.append("max_sync_files = ?")
+        params.append(max(0, req.max_sync_files))
+    if req.allow_download is not None:
+        updates.append("allow_download = ?")
+        params.append(1 if req.allow_download else 0)
+
+    if updates:
+        params.append(target_user_id)
+        conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+    user_fresh = conn.execute("SELECT * FROM users WHERE id = ?", (target_user_id,)).fetchone()
+    eff = get_user_effective_permissions(conn, dict(user_fresh))
+    conn.close()
+
+    return {
+        "success": True,
+        "message": f"Custom permissions updated for {u['email']}.",
+        "effective_permissions": eff
+    }
 
 
 @router.post("/api/admin/users/{target_user_id}/allow-sync")

@@ -23,3 +23,23 @@ class BanRequest(BaseModel):
 
 class AdminWarningRequest(BaseModel):
     warning_message: str
+
+class TierPermissionItem(BaseModel):
+    tier_id: str
+    tier_name: str
+    allow_sync: bool = True
+    max_sync_files: int = 5
+    allow_dataset_download: bool = True
+    allow_daraz_download: bool = True
+    can_use_scraper: bool = True
+    can_use_marketing: bool = True
+
+class SaveTierPermissionsRequest(BaseModel):
+    tiers: list[TierPermissionItem]
+    apply_to_existing_users: Optional[bool] = False
+
+class UserPermissionOverrideRequest(BaseModel):
+    allow_sync: Optional[int] = None
+    max_sync_files: Optional[int] = None
+    allow_download: Optional[int] = None
+    plan_tier: Optional[str] = None

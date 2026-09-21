@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Header, UploadFile, File,
 from database import get_db, is_sqlite_active
 from core.constants import UPLOAD_FOLDER, SCRAPE_RESULTS_FOLDER
 from core.security import decode_jwt_token
-from core.dependencies import get_current_user, get_admin_user, get_user_plan_tier, user_can_sync_to_cloud
+from core.dependencies import get_current_user, get_admin_user, get_user_plan_tier, user_can_sync_to_cloud, get_user_effective_permissions
 from services.dataset_service import (
     resolve_dataset_file_path,
     clean_lead_df,
@@ -430,6 +430,16 @@ def export_dataset(dataset_id: str, request: Request, format: Optional[str] = "e
         if not is_admin and job_user_id != current_user["id"]:
             conn.close()
             raise HTTPException(status_code=403, detail="Permission denied. You can only export your own scrape jobs.")
+
+        is_daraz = (job and job.get("scraper_type") == "daraz") or (synced_ds and synced_ds.get("proposed_category") == "daraz_ecommerce")
+        if is_daraz and not is_admin:
+            eff_perms = get_user_effective_permissions(conn, current_user)
+            if not eff_perms.get("allow_daraz_download"):
+                conn.close()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Downloading raw Daraz Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
+                )
 
         file_path = (job["result_path"] if job and job["result_path"] else (synced_ds["file_path"] if synced_ds else None))
         title_name = (job["query"] if job and job["query"] else (synced_ds["name"] if synced_ds else f"Job_{job_real_id}"))
