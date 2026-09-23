@@ -9,19 +9,30 @@ from core.constants import SERVER_START_TIME
 
 router = APIRouter(tags=["Health & System"])
 
+_last_db_check_time = 0.0
+_last_db_status = "ok"
+DB_HEALTH_CACHE_TTL_SEC = 20.0  # Cache DB check for 20 seconds
+
 @router.get("/health")
 @router.get("/api/health")
 def health_check():
     """Lightweight health check endpoint for uptime monitors, desktop dots, and Render keep-alive pings"""
-    db_status = "ok"
-    try:
-        conn = get_db()
-        conn.execute("SELECT 1;").fetchone()
-        conn.close()
-    except Exception as e:
-        db_status = f"unhealthy: {str(e)}"
+    global _last_db_check_time, _last_db_status
+    now = time.time()
+    
+    # Only hit Supabase PostgreSQL if cache has expired or last check failed
+    if (now - _last_db_check_time >= DB_HEALTH_CACHE_TTL_SEC) or _last_db_status != "ok":
+        try:
+            conn = get_db()
+            conn.execute("SELECT 1;").fetchone()
+            conn.close()
+            _last_db_status = "ok"
+        except Exception as e:
+            _last_db_status = f"unhealthy: {str(e)}"
+        _last_db_check_time = now
 
-    uptime_sec = int(time.time() - SERVER_START_TIME)
+    db_status = _last_db_status
+    uptime_sec = int(now - SERVER_START_TIME)
     uptime_str = f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s"
     db_mode = "sqlite" if is_sqlite_active() else "postgres"
     return {
