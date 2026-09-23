@@ -30,7 +30,19 @@ def get_payment_gateway_settings():
     conn.close()
     
     settings_dict = {row["setting_key"]: row["setting_value"] for row in rows if row["setting_value"]}
-    pkg_cfg = load_credit_packages_config()
+    
+    # 1. Load dynamic package configuration from database (Supabase PostgreSQL)
+    pkg_cfg = None
+    if "packages_config" in settings_dict:
+        try:
+            pkg_cfg = json.loads(settings_dict["packages_config"])
+        except Exception as e:
+            print("[PAYMENTS] Error parsing packages_config from database:", e)
+
+    # 2. Fallback to local packages.json / config defaults
+    if not pkg_cfg or not pkg_cfg.get("packages"):
+        pkg_cfg = load_credit_packages_config()
+
     return {
         "bkash_number": settings_dict.get("bkash_number") or BKASH_NUMBER,
         "bkash_account_type": settings_dict.get("bkash_account_type") or BKASH_ACCOUNT_TYPE,
@@ -102,29 +114,63 @@ def save_admin_package_settings(req: SavePackagesPayload, admin_user: dict = Dep
     if admin_user.get("role") not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Superadmin or Admin permission required.")
 
+    save_data = {
+        "packages": req.packages,
+        "custom_package": req.custom_package or {
+            "name": "Custom Upgrade",
+            "price_per_credit_bdt": 10,
+            "min_credits": 10,
+            "max_credits": 5000,
+            "step": 10,
+            "description": "Select the exact credit amount your team requires:"
+        }
+    }
+
+    # 1. Persist directly in central Supabase PostgreSQL (payment_settings table)
+    try:
+        conn = get_db()
+        json_str = json.dumps(save_data, ensure_ascii=False)
+        conn.execute(
+            "INSERT INTO payment_settings (setting_key, setting_value) VALUES ('packages_config', ?) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+            (json_str,)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("[PAYMENTS] Error saving packages_config to database:", e)
+        raise HTTPException(status_code=500, detail=f"Failed to save package settings to database: {str(e)}")
+
+    # 2. Mirror to packages.json on disk as local backup / cache
     pkg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages.json")
     try:
-        save_data = {
-            "packages": req.packages,
-            "custom_package": req.custom_package or {
-                "name": "Custom Upgrade",
-                "price_per_credit_bdt": 10,
-                "min_credits": 10,
-                "max_credits": 5000,
-                "step": 10,
-                "description": "Select the exact credit amount your team requires:"
-            }
-        }
+        existing_data = {}
+        if os.path.exists(pkg_file):
+            try:
+                with open(pkg_file, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+            except Exception:
+                pass
+        existing_data["packages"] = save_data["packages"]
+        existing_data["custom_package"] = save_data["custom_package"]
         with open(pkg_file, "w", encoding="utf-8") as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save package settings: {str(e)}")
+        print("[PAYMENTS] Note: Could not write packages.json disk mirror:", e)
 
     return {"success": True, "message": "Package prices and features updated successfully!"}
 
 
 @router.get("/api/config/packages")
 def get_packages_config():
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT setting_value FROM payment_settings WHERE setting_key = 'packages_config'").fetchone()
+        conn.close()
+        if row and row["setting_value"]:
+            return json.loads(row["setting_value"])
+    except Exception as e:
+        print("[PAYMENTS] Error reading packages_config from database:", e)
+
     pkg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages.json")
     if os.path.exists(pkg_file):
         with open(pkg_file, "r", encoding="utf-8") as f:
