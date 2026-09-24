@@ -371,7 +371,7 @@ def get_all_users(admin_user: dict = Depends(get_admin_user)):
 def get_all_tier_permissions(admin_user: dict = Depends(get_admin_user)):
     """Returns access control permissions for all plan tiers (starter, pro, enterprise + dynamic packages)"""
     conn = get_db()
-    # Read packages from database first, fallback to packages.json
+    # Read packages from database
     custom_packages = []
     try:
         row = conn.execute("SELECT setting_value FROM payment_settings WHERE setting_key = 'packages_config'").fetchone()
@@ -381,15 +381,7 @@ def get_all_tier_permissions(admin_user: dict = Depends(get_admin_user)):
     except Exception as e:
         print("[TIER PERMISSIONS] Error reading packages_config from database:", e)
 
-    if not custom_packages:
-        pkg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages.json")
-        if os.path.exists(pkg_file):
-            try:
-                with open(pkg_file, "r", encoding="utf-8") as f:
-                    pdata = json.load(f)
-                    custom_packages = pdata.get("packages", [])
-            except Exception:
-                pass
+
 
     for pkg in custom_packages:
         pid = pkg.get("id")

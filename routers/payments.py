@@ -19,7 +19,6 @@ from config import (
     BKASH_ACCOUNT_TYPE,
     PATHAO_NUMBER,
     PATHAO_ACCOUNT_TYPE,
-    load_credit_packages_config,
 )
 
 router = APIRouter(tags=["Payments & Packages"])
@@ -31,7 +30,7 @@ def get_payment_gateway_settings():
     
     settings_dict = {row["setting_key"]: row["setting_value"] for row in rows if row["setting_value"]}
     
-    # 1. Load dynamic package configuration from database (Supabase PostgreSQL)
+    # Load dynamic package configuration from database (Supabase PostgreSQL)
     pkg_cfg = None
     if "packages_config" in settings_dict:
         try:
@@ -39,9 +38,8 @@ def get_payment_gateway_settings():
         except Exception as e:
             print("[PAYMENTS] Error parsing packages_config from database:", e)
 
-    # 2. Fallback to local packages.json / config defaults
-    if not pkg_cfg or not pkg_cfg.get("packages"):
-        pkg_cfg = load_credit_packages_config()
+    if not pkg_cfg or not isinstance(pkg_cfg, dict):
+        pkg_cfg = {"packages": [], "custom_package": {}}
 
     return {
         "bkash_number": settings_dict.get("bkash_number") or BKASH_NUMBER,
@@ -140,23 +138,6 @@ def save_admin_package_settings(req: SavePackagesPayload, admin_user: dict = Dep
         print("[PAYMENTS] Error saving packages_config to database:", e)
         raise HTTPException(status_code=500, detail=f"Failed to save package settings to database: {str(e)}")
 
-    # 2. Mirror to packages.json on disk as local backup / cache
-    pkg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages.json")
-    try:
-        existing_data = {}
-        if os.path.exists(pkg_file):
-            try:
-                with open(pkg_file, "r", encoding="utf-8") as f:
-                    existing_data = json.load(f)
-            except Exception:
-                pass
-        existing_data["packages"] = save_data["packages"]
-        existing_data["custom_package"] = save_data["custom_package"]
-        with open(pkg_file, "w", encoding="utf-8") as f:
-            json.dump(existing_data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print("[PAYMENTS] Note: Could not write packages.json disk mirror:", e)
-
     return {"success": True, "message": "Package prices and features updated successfully!"}
 
 
@@ -171,10 +152,6 @@ def get_packages_config():
     except Exception as e:
         print("[PAYMENTS] Error reading packages_config from database:", e)
 
-    pkg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages.json")
-    if os.path.exists(pkg_file):
-        with open(pkg_file, "r", encoding="utf-8") as f:
-            return json.load(f)
     return {"packages": []}
 
 
