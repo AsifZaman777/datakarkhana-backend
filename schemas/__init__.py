@@ -41,3 +41,20 @@ from .admin import (
     BanRequest,
     AdminWarningRequest,
 )
+from .models import (
+    ModelSpec,
+    SystemInfoResponse,
+    InspectHuggingFaceRequest,
+    InspectHuggingFaceResponse,
+    DownloadModelRequest,
+    DownloadProgressResponse,
+    InstalledModelInfo,
+    SetActiveModelRequest,
+    GenerateVariantsRequest,
+    GenerateVariantsResponse,
+    AuditSpamRequest,
+    AuditSpamResponse,
+    UniversalGenerateRequest,
+    UniversalGenerateResponse,
+)
+

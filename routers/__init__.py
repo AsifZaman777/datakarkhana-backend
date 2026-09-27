@@ -7,6 +7,7 @@ from routers.licenses import router as licenses_router
 from routers.marketing import router as marketing_router
 from routers.admin import router as admin_router
 from routers.config import router as config_router
+from routers.models import router as models_router
 
 __all__ = [
     "health_router",
@@ -18,4 +19,6 @@ __all__ = [
     "marketing_router",
     "admin_router",
     "config_router",
+    "models_router",
 ]
+

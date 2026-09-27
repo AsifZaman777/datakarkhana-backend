@@ -39,6 +39,7 @@ from routers import (
     marketing_router,
     admin_router,
     config_router,
+    models_router,
 )
 
 # Initialize FastAPI application
@@ -118,6 +119,7 @@ app.include_router(licenses_router)
 app.include_router(marketing_router)
 app.include_router(admin_router)
 app.include_router(config_router)
+app.include_router(models_router)
 
 # ── Background keep-alive & Startup ───────────────────────
 
