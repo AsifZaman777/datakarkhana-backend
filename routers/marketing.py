@@ -189,12 +189,20 @@ def send_whatsapp(req: WhatsAppCampaignRequest, current_user: dict = Depends(get
     conn.commit()
     conn.close()
 
-    # Background Campaign Thread
-    t = threading.Thread(target=run_whatsapp_campaign, args=(campaign_id, contacts, req.message_template, req.recipient_group, start_index))
+    # Background Campaign Thread — with ban protection config
+    ban_config = {
+        "message_variants": req.message_variants or [],
+        "delay_min": req.delay_min or 10,
+        "delay_max": req.delay_max or 30,
+        "break_after_messages": req.break_after_messages or 10,
+        "break_duration": req.break_duration or 120,
+    }
+    t = threading.Thread(target=run_whatsapp_campaign, args=(campaign_id, contacts, req.message_template, req.recipient_group, start_index), kwargs={"ban_config": ban_config})
     t.daemon = True
     t.start()
 
     return {"success": True, "campaign_id": campaign_id, "start_index": start_index}
+
 
 
 @router.post("/api/marketing/send-email")

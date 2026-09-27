@@ -7,6 +7,13 @@ class WhatsAppCampaignRequest(BaseModel):
     resume: Optional[bool] = False
     start_row: Optional[int] = None
     selected_contacts: Optional[List[Dict[str, Any]]] = None
+    # Ban protection config
+    message_variants: Optional[List[str]] = None
+    delay_min: Optional[int] = 10        # seconds
+    delay_max: Optional[int] = 30        # seconds
+    break_after_messages: Optional[int] = 10
+    break_duration: Optional[int] = 120  # seconds
+
 
 class EmailCampaignRequest(BaseModel):
     recipient_group: str

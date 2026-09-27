@@ -397,10 +397,19 @@ def dismiss_whatsapp_invalid_modal(driver):
     """Wrapper maintaining compatibility with existing calls"""
     return check_and_dismiss_invalid_modal(driver)
 
-def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group, start_index=0):
-    """Core WhatsApp human-emulating thread dispatch manager"""
+def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group, start_index=0, ban_config=None):
+    """Core WhatsApp human-emulating thread dispatch manager with ban protection"""
     
     failed_count = 0
+
+    # Ban protection defaults
+    if ban_config is None:
+        ban_config = {}
+    message_variants = ban_config.get("message_variants", [])
+    delay_min = max(5, ban_config.get("delay_min", 10))
+    delay_max = max(delay_min, ban_config.get("delay_max", 30))
+    break_after_n = max(3, ban_config.get("break_after_messages", 10))
+    break_duration_sec = max(30, ban_config.get("break_duration", 120))
 
     def log_status(msg):
         try:
@@ -426,6 +435,9 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
 
     log_status(f"Campaign started. Preparing Selenium WhatsApp session...")
     log_status(f"Starting from contact index: {start_index} | Total contacts: {len(contacts)}")
+    if message_variants:
+        log_status(f"🛡️ Ban Protection: {len(message_variants)} message variants loaded for random selection")
+    log_status(f"🛡️ Delay range: {delay_min}–{delay_max}s | Break every {break_after_n} msgs for {break_duration_sec}s")
 
     close_active_setup_driver()
     driver = None
@@ -470,12 +482,20 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
             phone = contact["phone"]
             name = contact["name"]
             formatted = format_phone(phone)
-            personalized_msg = template_text.replace("{name}", name)
 
-            # Cool down delay logic (Every 8 messages, sleep 2 min)
-            if idx > 0 and idx % 8 == 0:
-                log_status("Entering 2-minute cooldown to prevent accounts bans...")
-                for _ in range(24):
+            # Select message: random variant if available, else base template
+            if message_variants and len(message_variants) > 1:
+                chosen_template = random.choice(message_variants)
+                log_status(f"🎲 Randomly selected variant #{message_variants.index(chosen_template) + 1} for {name}")
+            else:
+                chosen_template = template_text
+            personalized_msg = chosen_template.replace("{name}", name)
+
+            # Cool down delay logic — configurable break
+            if idx > 0 and idx % break_after_n == 0:
+                log_status(f"🛡️ Entering {break_duration_sec}s ({break_duration_sec // 60}m {break_duration_sec % 60}s) cooldown break after {break_after_n} messages to prevent bans...")
+                break_ticks = break_duration_sec // 5
+                for _ in range(break_ticks):
                     if is_campaign_stopped(campaign_id):
                         log_status(f"Campaign stopped during cooldown. Paused at lead index: {current_index}.")
                         conn = get_db()
@@ -633,8 +653,9 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
 
                 log_status(f"✅ Message dispatched to {name} successfully! [{current_index + 1}/{len(contacts)}]")
 
-                # Settle down delay
-                delay = random.randint(10, 25)
+                # Settle down delay — uses ban protection config range
+                delay = random.randint(delay_min, delay_max)
+                log_status(f"🛡️ Waiting {delay}s before next message (range: {delay_min}–{delay_max}s)")
                 for _ in range(delay // 2):
                     if is_campaign_stopped(campaign_id):
                         log_status(f"Campaign stopped. Paused at lead index: {current_index + 1}.")
