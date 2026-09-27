@@ -13,3 +13,4 @@ requests
 websockets
 python-calamine
 XlsxWriter
+psutil>=5.9.0

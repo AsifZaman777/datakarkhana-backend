@@ -17,7 +17,10 @@ import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import requests
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 # ── Storage Path Resolution ───────────────────────────────
 
@@ -155,10 +158,20 @@ def _save_registry(data: Dict[str, Any]):
 def get_system_hardware_info() -> Dict[str, Any]:
     """Inspects host machine RAM, CPU cores, and free disk space."""
     models_dir = get_models_dir()
-    vmem = psutil.virtual_memory()
-    total_ram_gb = round(vmem.total / (1024 ** 3), 1)
-    available_ram_gb = round(vmem.available / (1024 ** 3), 1)
-    cpu_cores = psutil.cpu_count(logical=True) or 4
+    if psutil is not None:
+        try:
+            vmem = psutil.virtual_memory()
+            total_ram_gb = round(vmem.total / (1024 ** 3), 1)
+            available_ram_gb = round(vmem.available / (1024 ** 3), 1)
+            cpu_cores = psutil.cpu_count(logical=True) or (os.cpu_count() or 4)
+        except Exception:
+            total_ram_gb = 8.0
+            available_ram_gb = 4.0
+            cpu_cores = os.cpu_count() or 4
+    else:
+        total_ram_gb = 8.0
+        available_ram_gb = 4.0
+        cpu_cores = os.cpu_count() or 4
 
     try:
         disk_usage = shutil.disk_usage(models_dir)
