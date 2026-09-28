@@ -131,9 +131,17 @@ class AuditSpamResponse(BaseModel):
     latency_ms: int
 
 
+class ChatMessage(BaseModel):
+    """Single turn in a conversational exchange"""
+    role: str  # "system", "user", "assistant"
+    content: str
+
+
 class UniversalGenerateRequest(BaseModel):
-    """Universal prompt completion for plug-and-play local AI tasks"""
-    prompt: str
+    """Universal prompt completion and multi-turn chat for plug-and-play local AI tasks"""
+    prompt: Optional[str] = None
+    messages: Optional[List[ChatMessage]] = None
+    system_prompt: Optional[str] = None
     model_filename: Optional[str] = None
     max_tokens: Optional[int] = 512
     temperature: Optional[float] = 0.7

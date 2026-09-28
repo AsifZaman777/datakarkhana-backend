@@ -167,14 +167,26 @@ def audit_spam(payload: AuditSpamRequest):
 
 @router.post("/generate", response_model=UniversalGenerateResponse)
 def generate_text(payload: UniversalGenerateRequest):
-    """Universal prompt completion for plug-and-play local AI across the application."""
-    if not payload.prompt.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="prompt cannot be empty")
+    """Universal prompt completion and multi-turn chat for plug-and-play local AI across the application."""
+    effective_prompt = (payload.prompt or "").strip()
+    if not effective_prompt and payload.messages:
+        for msg in reversed(payload.messages):
+            if msg.role == "user" and msg.content.strip():
+                effective_prompt = msg.content.strip()
+                break
+
+    if not effective_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Prompt or user message cannot be empty",
+        )
 
     res = model_svc.universal_generate(
-        prompt=payload.prompt,
+        prompt=effective_prompt,
         model_filename=payload.model_filename,
         max_tokens=payload.max_tokens or 512,
         temperature=payload.temperature or 0.7,
+        system_prompt=payload.system_prompt,
+        messages=[{"role": m.role, "content": m.content} for m in payload.messages] if payload.messages else None,
     )
     return res
