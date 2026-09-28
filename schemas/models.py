@@ -67,14 +67,15 @@ class DownloadProgressResponse(BaseModel):
     task_id: str
     model_id: str
     filename: str
-    name: str
-    total_bytes: int
-    downloaded_bytes: int
-    progress_percent: float
-    speed_mbps: float
-    eta_seconds: int
-    status: str  # "pending", "downloading", "completed", "failed", "cancelled"
+    name: str = ""
+    total_bytes: int = 0
+    downloaded_bytes: int = 0
+    progress_percent: float = 0.0
+    speed_mbps: float = 0.0
+    eta_seconds: int = 0
+    status: str = "pending"  # "pending", "downloading", "completed", "failed", "cancelled"
     error: Optional[str] = None
+    message: Optional[str] = None
 
 
 class InstalledModelInfo(BaseModel):

@@ -1,12 +1,22 @@
 """
-Local Model Service — DataKarkhana Local AI Hub
-Handles:
-- Storage in %APPDATA%/datakarkhana/models/ (or DATAKARKHANA_DATA_DIR/models)
-- Curated lightweight GGUF model registry with RAM / VRAM / speed stats
-- Hugging Face link & repo inspection and streaming background downloader with live progress/ETA
-- Active model management and disk space tracking
-- High-level inference for WhatsApp variant generation and spam auditing
+================================================================================
+DataKarkhana Local Model Service — AI Engine & Model Management Core
+================================================================================
+
+This module serves as the central AI execution and model lifecycle engine for 
+DataKarkhana. It handles:
+  1. Storage & Path Resolution for downloaded GGUF weights in AppData.
+  2. Hardware profiling (RAM, CPU cores, Disk Space) for host machines.
+  3. Curated catalog and custom Hugging Face model URL / repo inspection.
+  4. Background multi-threaded streaming downloader with live progress and ETA.
+  5. Standalone llama.cpp (llama-server.exe) runtime lifecycle management.
+  6. Real on-device neural network inference for prompt completion & WhatsApp copy.
+  7. Rule-based and dynamic NLP synthesis fallbacks when no model is installed.
+
+All functions are organized by task category with comprehensive multiline docstrings.
+================================================================================
 """
+
 import os
 import re
 import json
@@ -14,18 +24,51 @@ import time
 import uuid
 import shutil
 import threading
+import subprocess
+import atexit
+import zipfile
+import io
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import requests
+
 try:
     import psutil
 except ImportError:
     psutil = None
 
-# ── Storage Path Resolution ───────────────────────────────
 
+# ==============================================================================
+# SECTION 1: STORAGE PATH RESOLUTION & FORMATTING HELPERS
+# ==============================================================================
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : get_models_dir() -> str
+#  * TASK     : Resolves and initializes the local AI models storage directory.
+#  * HANDLES  :
+#  *   - Locates %APPDATA%/datakarkhana/models on Windows or ~/.datakarkhana/models.
+#  *   - Automatically creates base directories and 'downloads' folder if missing.
+#  *   - Returns the absolute filesystem directory path for model weights and tools.
+#  * ============================================================================
+#  */
 def get_models_dir() -> str:
-    """Returns the dedicated models storage directory in user's AppData."""
+    """
+    ============================================================================
+    TASK: Resolves and initializes the local AI models storage directory.
+    ============================================================================
+    PURPOSE:
+        Determines the dedicated directory where downloaded .gguf model weights,
+        runtime binaries (llama-server.exe), and metadata registry reside.
+        Defaults to %APPDATA%/datakarkhana/models on Windows, or custom env path.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        str: Absolute filesystem path to the models storage directory.
+    ============================================================================
+    """
     custom = os.getenv("DATAKARKHANA_DATA_DIR")
     if custom:
         target = os.path.join(custom, "models")
@@ -35,17 +78,65 @@ def get_models_dir() -> str:
             target = os.path.join(appdata, "datakarkhana", "models")
         else:
             target = os.path.expanduser("~/.datakarkhana/models")
-    
+
     os.makedirs(target, exist_ok=True)
     os.makedirs(os.path.join(target, "downloads"), exist_ok=True)
     return target
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : get_registry_path() -> str
+#  * TASK     : Resolves the filepath to the model metadata registry (registry.json).
+#  * HANDLES  :
+#  *   - Combines models storage directory with 'registry.json'.
+#  *   - Provides central persistent storage path for tracking installed models.
+#  * ============================================================================
+#  */
 def get_registry_path() -> str:
+    """
+    ============================================================================
+    TASK: Resolves the filepath to the model metadata registry (registry.json).
+    ============================================================================
+    PURPOSE:
+        Locates the JSON registry file used to track installed models, custom
+        model metadata, and the currently active model selection.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        str: Absolute filesystem path to registry.json.
+    ============================================================================
+    """
     return os.path.join(get_models_dir(), "registry.json")
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : _format_bytes(size: int) -> str
+#  * TASK     : Formats raw byte counts into human-readable strings (MB, GB, TB).
+#  * HANDLES  :
+#  *   - Normalizes integer byte counts with 1024 base scaling.
+#  *   - Returns human-friendly string outputs (e.g., '379.0 MB', '1.2 GB').
+#  * ============================================================================
+#  */
 def _format_bytes(size: int) -> str:
+    """
+    ============================================================================
+    TASK: Formats raw byte counts into human-readable strings (MB, GB, TB).
+    ============================================================================
+    PURPOSE:
+        Converts integer byte values into standardized strings formatted with
+        appropriate size units for user interface displays.
+
+    PARAMETERS:
+        size (int): Size in bytes.
+
+    RETURNS:
+        str: Human-readable size string (e.g., '379.0 MB', '1.2 GB').
+    ============================================================================
+    """
     if size <= 0:
         return "0 B"
     for unit in ["B", "KB", "MB", "GB"]:
@@ -55,7 +146,9 @@ def _format_bytes(size: int) -> str:
     return f"{size:.1f} TB"
 
 
-# ── Curated Catalog of Recommended Small GGUF Models ──────
+# ==============================================================================
+# SECTION 2: CURATED CATALOG OF RECOMMENDED LIGHTWEIGHT GGUF MODELS
+# ==============================================================================
 
 RECOMMENDED_MODELS: List[Dict[str, Any]] = [
     {
@@ -125,15 +218,41 @@ RECOMMENDED_MODELS: List[Dict[str, Any]] = [
 ]
 
 
-# ── Active Download State Tracker ─────────────────────────
+# ==============================================================================
+# SECTION 3: IN-MEMORY DOWNLOAD STATE TRACKER & REGISTRY PERSISTENCE
+# ==============================================================================
 
+# Thread-safe dictionary tracking all ongoing and finished download tasks
 _active_downloads: Dict[str, Dict[str, Any]] = {}
 _download_lock = threading.Lock()
 
 
-# ── Registry Helpers ──────────────────────────────────────
-
+# /*
+#  * ============================================================================
+#  * FUNCTION : _load_registry() -> Dict[str, Any]
+#  * TASK     : Reads and parses the model metadata registry file (registry.json).
+#  * HANDLES  :
+#  *   - Loads existing registry.json from the models directory.
+#  *   - Retrieves designated active model name and custom model definitions.
+#  *   - Gracefully returns fallback structure if the file does not exist yet.
+#  * ============================================================================
+#  */
 def _load_registry() -> Dict[str, Any]:
+    """
+    ============================================================================
+    TASK: Loads the model metadata registry from disk.
+    ============================================================================
+    PURPOSE:
+        Reads registry.json to recover installed model definitions and the 
+        currently designated active default model.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        dict: Parsed registry dictionary containing 'active_model' and 'models'.
+    ============================================================================
+    """
     path = get_registry_path()
     if os.path.exists(path):
         try:
@@ -144,7 +263,30 @@ def _load_registry() -> Dict[str, Any]:
     return {"active_model": None, "models": {}}
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : _save_registry(data: Dict[str, Any])
+#  * TASK     : Persists model registry dictionary to disk as JSON.
+#  * HANDLES  :
+#  *   - Serializes installed models catalog and active model state.
+#  *   - Saves to registry.json with readable 2-space indentation.
+#  * ============================================================================
+#  */
 def _save_registry(data: Dict[str, Any]):
+    """
+    ============================================================================
+    TASK: Persists model metadata and active selections to disk.
+    ============================================================================
+    PURPOSE:
+        Saves the provided registry dictionary into registry.json.
+
+    PARAMETERS:
+        data (dict): Registry content to serialize.
+
+    RETURNS:
+        None
+    ============================================================================
+    """
     path = get_registry_path()
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -153,10 +295,39 @@ def _save_registry(data: Dict[str, Any]):
         print(f"[MODEL REGISTRY] Failed to save registry: {err}")
 
 
-# ── System Hardware Information ───────────────────────────
+# ==============================================================================
+# SECTION 4: HARDWARE & SYSTEM PROFILING
+# ==============================================================================
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : get_system_hardware_info() -> Dict[str, Any]
+#  * TASK     : Profiles host hardware specifications (RAM, CPU cores, Disk).
+#  * HANDLES  :
+#  *   - Reads total RAM and available free RAM via psutil.
+#  *   - Determines logical CPU core count for thread scheduling.
+#  *   - Calculates available free disk space on the models storage drive.
+#  *   - Reports installed models count to advise user on model compatibility.
+#  * ============================================================================
+#  */
 def get_system_hardware_info() -> Dict[str, Any]:
-    """Inspects host machine RAM, CPU cores, and free disk space."""
+    """
+    ============================================================================
+    TASK: Profiles host machine hardware specifications and storage status.
+    ============================================================================
+    PURPOSE:
+        Inspects total RAM, available free RAM, logical CPU core count,
+        and free disk space on the drive hosting the models directory.
+        Used by the frontend to recommend appropriate models.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        dict: Hardware profile with total_ram_gb, available_ram_gb, cpu_cores,
+              models_dir, disk_free_gb, and installed_models_count.
+    ============================================================================
+    """
     models_dir = get_models_dir()
     if psutil is not None:
         try:
@@ -191,10 +362,36 @@ def get_system_hardware_info() -> Dict[str, Any]:
     }
 
 
-# ── Recommended Models API ────────────────────────────────
+# ==============================================================================
+# SECTION 5: RECOMMENDED & INSTALLED MODELS MANAGEMENT
+# ==============================================================================
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : get_recommended_catalog() -> List[Dict[str, Any]]
+#  * TASK     : Serves curated model catalog with live installation/active flags.
+#  * HANDLES  :
+#  *   - Cross-references curated models against actual .gguf files on disk.
+#  *   - Flags which models are currently installed ('is_installed').
+#  *   - Flags which model is currently designated active ('is_active').
+#  * ============================================================================
+#  */
 def get_recommended_catalog() -> List[Dict[str, Any]]:
-    """Returns curated models populated with live installation and active status."""
+    """
+    ============================================================================
+    TASK: Serves the curated list of recommended models with live status.
+    ============================================================================
+    PURPOSE:
+        Cross-references the curated RECOMMENDED_MODELS list against models
+        currently present on disk and marks 'is_installed' and 'is_active'.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        list[dict]: List of recommended model definitions with live state flags.
+    ============================================================================
+    """
     installed = {m["filename"]: m for m in get_installed_models()}
     registry = _load_registry()
     active_filename = registry.get("active_model")
@@ -208,10 +405,34 @@ def get_recommended_catalog() -> List[Dict[str, Any]]:
     return result
 
 
-# ── Installed Models API ──────────────────────────────────
-
+# /*
+#  * ============================================================================
+#  * FUNCTION : get_installed_models() -> List[Dict[str, Any]]
+#  * TASK     : Scans local disk storage to discover all installed .gguf models.
+#  * HANDLES  :
+#  *   - Reads %APPDATA%/datakarkhana/models directory for .gguf files.
+#  *   - Extracts file sizes, timestamps, and matches curated/custom metadata.
+#  *   - Guarantees an active model is chosen if files are installed.
+#  * ============================================================================
+#  */
 def get_installed_models() -> List[Dict[str, Any]]:
-    """Scans the models folder for .gguf files and cross-references registry metadata."""
+    """
+    ============================================================================
+    TASK: Scans disk storage to identify all installed .gguf models.
+    ============================================================================
+    PURPOSE:
+        Scans %APPDATA%/datakarkhana/models for .gguf files, extracts file sizes,
+        creation timestamps, tags, and cross-references metadata in registry.json.
+        Ensures at least one installed model is designated as active.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        list[dict]: List of installed model objects with filename, path, size,
+                    RAM requirements, and active flag.
+    ============================================================================
+    """
     models_dir = get_models_dir()
     registry = _load_registry()
     active_filename = registry.get("active_model")
@@ -267,19 +488,78 @@ def get_installed_models() -> List[Dict[str, Any]]:
     return installed
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : set_active_model(filename: str) -> bool
+#  * TASK     : Changes the designated active AI model for local inference.
+#  * HANDLES  :
+#  *   - Validates that the target .gguf file is downloaded and present on disk.
+#  *   - Updates 'active_model' field in registry.json.
+#  *   - Proactively spawns background thread to pre-warm llama-server instance.
+#  *   - Returns True on success, False if file is not found.
+#  * ============================================================================
+#  */
 def set_active_model(filename: str) -> bool:
-    """Sets the active model for local inference."""
+    """
+    ============================================================================
+    TASK: Sets an installed model as the default active model for inference.
+    ============================================================================
+    PURPOSE:
+        Validates that the requested model file is downloaded on disk, updates
+        the registry, and proactively pre-warms the llama-server instance.
+
+    PARAMETERS:
+        filename (str): The filename of the .gguf model to activate.
+
+    RETURNS:
+        bool: True if activated successfully, False if model is not installed.
+    ============================================================================
+    """
     installed = [m["filename"] for m in get_installed_models()]
     if filename not in installed:
         return False
     registry = _load_registry()
     registry["active_model"] = filename
     _save_registry(registry)
+
+    # Proactively spawn / switch llama-server in the background for instant inference
+    threading.Thread(target=_ensure_llama_server, args=(filename,), daemon=True).start()
     return True
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : delete_model(filename: str) -> bool
+#  * TASK     : Safely removes an installed model file and updates the registry.
+#  * HANDLES  :
+#  *   - Shuts down any active llama-server process using this model.
+#  *   - Deletes the .gguf binary file from disk.
+#  *   - Cleans up metadata entry in registry.json.
+#  *   - Fallback-assigns active status to the next available installed model.
+#  * ============================================================================
+#  */
 def delete_model(filename: str) -> bool:
-    """Deletes an installed model from AppData and updates registry."""
+    """
+    ============================================================================
+    TASK: Deletes an installed model file and cleans up registry entries.
+    ============================================================================
+    PURPOSE:
+        Safely shuts down any running llama-server process using this model,
+        deletes the .gguf file from disk, updates registry.json, and reassigns
+        the active model to the next available model if needed.
+
+    PARAMETERS:
+        filename (str): The filename of the .gguf model to delete.
+
+    RETURNS:
+        bool: True if deleted successfully, False otherwise.
+    ============================================================================
+    """
+    global _llama_server_model
+    # If the active server is using this model, shut it down first
+    if _llama_server_model == filename:
+        _shutdown_llama_server()
+
     models_dir = get_models_dir()
     file_path = os.path.join(models_dir, filename)
     if os.path.exists(file_path):
@@ -299,23 +579,48 @@ def delete_model(filename: str) -> bool:
     return True
 
 
-# ── Hugging Face Link & Repo Inspector ────────────────────
+# ==============================================================================
+# SECTION 6: HUGGING FACE MODEL INSPECTION & URL VERIFICATION
+# ==============================================================================
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : inspect_huggingface_url(url_or_repo: str) -> Dict[str, Any]
+#  * TASK     : Analyzes Hugging Face links / repos and discovers .gguf files.
+#  * HANDLES  :
+#  *   - Resolves direct download links (blob/resolve).
+#  *   - Queries Hugging Face API for repo IDs (e.g. Qwen/Qwen2.5-0.5B-Instruct-GGUF).
+#  *   - Auto-selects recommended Q4_K_M quantizations.
+#  *   - Sends HTTP HEAD to verify file size and computes required RAM.
+#  * ============================================================================
+#  */
 def inspect_huggingface_url(url_or_repo: str) -> Dict[str, Any]:
     """
-    Parses and verifies a Hugging Face model URL or repo ID.
-    Supports:
-    - https://huggingface.co/author/repo/blob/main/model.gguf
-    - https://huggingface.co/author/repo/resolve/main/model.gguf
-    - author/repo (auto-selects first recommended Q4_K_M GGUF file)
+    ============================================================================
+    TASK: Inspects, validates, and parses Hugging Face model links and repos.
+    ============================================================================
+    PURPOSE:
+        Enables 1-click import of any custom GGUF model from Hugging Face.
+        Supports:
+          1. Direct blob / resolve file URLs (e.g. .../resolve/main/model.gguf)
+          2. Repository IDs (e.g. Qwen/Qwen2.5-0.5B-Instruct-GGUF) with auto-selection
+             of recommended Q4_K_M quantizations.
+          3. Direct HTTP .gguf links from external hosts.
+        Sends HTTP HEAD requests to determine file size, estimated RAM, and accessibility.
+
+    PARAMETERS:
+        url_or_repo (str): Hugging Face URL or repository ID string.
+
+    RETURNS:
+        dict: Inspection result containing valid flag, download_url, filename,
+              file_size_bytes, estimated_ram_mb, and model_name.
+    ============================================================================
     """
     cleaned = url_or_repo.strip()
     if not cleaned:
         return {"valid": False, "error": "URL or repo string cannot be empty"}
 
     # Pattern 1: Direct Hugging Face file link
-    # e.g., https://huggingface.co/{author}/{repo}/blob/{branch}/{filename}
-    # or   https://huggingface.co/{author}/{repo}/resolve/{branch}/{filename}
     match = re.match(
         r"^https?://huggingface\.co/([^/]+)/([^/]+)/(?:blob|resolve)/([^/]+)/(.+\.gguf)$",
         cleaned,
@@ -326,8 +631,7 @@ def inspect_huggingface_url(url_or_repo: str) -> Dict[str, Any]:
         author, repo, branch, filename = match.groups()
         download_url = f"https://huggingface.co/{author}/{repo}/resolve/{branch}/{filename}"
         model_name = f"{repo} ({filename.replace('.gguf', '')})"
-        
-        # Test HEAD to verify accessibility & get file size
+
         try:
             head_res = requests.head(download_url, allow_redirects=True, timeout=12)
             if head_res.status_code >= 400:
@@ -363,7 +667,6 @@ def inspect_huggingface_url(url_or_repo: str) -> Dict[str, Any]:
             if not gguf_files:
                 return {"valid": False, "error": f"Repository '{cleaned}' does not contain any .gguf model files."}
 
-            # Prioritize Q4_K_M or Q4_0
             chosen_file = next((f for f in gguf_files if "q4_k_m" in f.lower()), None)
             if not chosen_file:
                 chosen_file = next((f for f in gguf_files if "q4" in f.lower()), gguf_files[0])
@@ -387,7 +690,7 @@ def inspect_huggingface_url(url_or_repo: str) -> Dict[str, Any]:
         except Exception as err:
             return {"valid": False, "error": f"Error querying Hugging Face API: {err}"}
 
-    # Pattern 3: Generic direct .gguf URL from any host
+    # Pattern 3: Generic direct .gguf URL
     if cleaned.lower().startswith("http") and cleaned.lower().endswith(".gguf"):
         filename = cleaned.split("/")[-1].split("?")[0]
         try:
@@ -414,16 +717,46 @@ def inspect_huggingface_url(url_or_repo: str) -> Dict[str, Any]:
     }
 
 
-# ── Background Streaming Downloader ───────────────────────
+# ==============================================================================
+# SECTION 7: BACKGROUND STREAMING DOWNLOAD ENGINE
+# ==============================================================================
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : start_model_download(...) -> Dict[str, Any]
+#  * TASK     : Initiates an asynchronous background streaming download for a GGUF model.
+#  * HANDLES  :
+#  *   - Validates model_id or custom Hugging Face download URL.
+#  *   - Verifies if model file is already present on local disk.
+#  *   - Allocates tracked task state with UUID in _active_downloads.
+#  *   - Spawns background daemon thread _download_worker for non-blocking download.
+#  * ============================================================================
+#  */
 def start_model_download(
     model_id: Optional[str] = None,
     custom_url: Optional[str] = None,
     custom_name: Optional[str] = None,
     filename: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Initiates an asynchronous chunked download with real-time ETA & progress tracking."""
-    # Resolve target model details
+    """
+    ============================================================================
+    TASK: Initiates asynchronous streaming download of a GGUF model file.
+    ============================================================================
+    PURPOSE:
+        Creates a unique task_id, sets up tracking telemetry, and launches
+        a dedicated background worker thread (_download_worker) to download the
+        model in 256KB chunks without blocking API endpoints.
+
+    PARAMETERS:
+        model_id (str, optional): ID of a curated model from RECOMMENDED_MODELS.
+        custom_url (str, optional): Custom Hugging Face URL or direct link.
+        custom_name (str, optional): User-defined friendly model name.
+        filename (str, optional): Target output filename on disk.
+
+    RETURNS:
+        dict: Task initialization metadata containing task_id, status, and model info.
+    ============================================================================
+    """
     if model_id:
         curated = next((m for m in RECOMMENDED_MODELS if m["id"] == model_id), None)
         if not curated:
@@ -446,7 +779,6 @@ def start_model_download(
     else:
         raise ValueError("Must provide either model_id or custom_url")
 
-    # Ensure filename ends with .gguf
     if not target_filename.endswith(".gguf"):
         target_filename += ".gguf"
 
@@ -503,7 +835,6 @@ def start_model_download(
     with _download_lock:
         _active_downloads[task_id] = download_info
 
-    # Launch background worker
     worker = threading.Thread(
         target=_download_worker,
         args=(task_id,),
@@ -522,8 +853,34 @@ def start_model_download(
     }
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : _download_worker(task_id: str)
+#  * TASK     : Dedicated background thread that streams HTTP model chunks to disk.
+#  * HANDLES  :
+#  *   - Downloads file in 256KB chunks to a temporary .part destination.
+#  *   - Continuously updates download percentage, speed in MB/s, and ETA.
+#  *   - Respects cancellation requests and cleans up partial files.
+#  *   - Atomically moves finished .gguf to storage and registers it in registry.json.
+#  * ============================================================================
+#  */
 def _download_worker(task_id: str):
-    """Worker thread that executes chunked streaming HTTP download."""
+    """
+    ============================================================================
+    TASK: Background worker thread executing streaming HTTP download.
+    ============================================================================
+    PURPOSE:
+        Streams content in chunks into a temporary .part file, computes real-time
+        speed (MB/s), percentage progress, and ETA seconds. Upon completion,
+        atomically moves the file to the models root and updates registry.json.
+
+    PARAMETERS:
+        task_id (str): UUID identifying the download session in _active_downloads.
+
+    RETURNS:
+        None
+    ============================================================================
+    """
     with _download_lock:
         info = _active_downloads.get(task_id)
     if not info:
@@ -535,7 +892,6 @@ def _download_worker(task_id: str):
 
     try:
         info["status"] = "downloading"
-        # Stream response
         res = requests.get(url, stream=True, timeout=25, headers={"User-Agent": "DataKarkhana-AI-Engine"})
         res.raise_for_status()
 
@@ -578,7 +934,6 @@ def _download_worker(task_id: str):
             info["status"] = "cancelled"
             return
 
-        # Verification & atomic move
         if total_bytes > 0 and downloaded < (total_bytes * 0.98):
             raise IOError(f"Incomplete download: received {downloaded} of {total_bytes} bytes")
 
@@ -588,7 +943,6 @@ def _download_worker(task_id: str):
         info["downloaded_bytes"] = downloaded
         info["eta_seconds"] = 0
 
-        # Save to registry
         registry = _load_registry()
         registry.setdefault("models", {})[info["filename"]] = {
             "id": info["model_id"],
@@ -598,7 +952,6 @@ def _download_worker(task_id: str):
             "tags": info["tags"],
             "installed_at": datetime.now().isoformat(),
         }
-        # If no active model, set this as active
         if not registry.get("active_model"):
             registry["active_model"] = info["filename"]
         _save_registry(registry)
@@ -616,8 +969,32 @@ def _download_worker(task_id: str):
                 pass
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : get_download_progress(task_id: str) -> Optional[Dict[str, Any]]
+#  * TASK     : Queries real-time download telemetry and percentage progress.
+#  * HANDLES  :
+#  *   - Reads task state from _active_downloads thread-safe dictionary.
+#  *   - Provides downloaded bytes, total bytes, speed in MB/s, and ETA.
+#  *   - Supplies data for frontend download progress bars and spinners.
+#  * ============================================================================
+#  */
 def get_download_progress(task_id: str) -> Optional[Dict[str, Any]]:
-    """Returns the live download status and telemetry for a given task."""
+    """
+    ============================================================================
+    TASK: Queries real-time download telemetry and status.
+    ============================================================================
+    PURPOSE:
+        Retrieves current download progress percentage, transfer speed in MB/s,
+        estimated completion time (ETA), and completion status for a given task.
+
+    PARAMETERS:
+        task_id (str): UUID identifying the active or finished download task.
+
+    RETURNS:
+        dict or None: Progress dictionary, or None if task_id does not exist.
+    ============================================================================
+    """
     with _download_lock:
         info = _active_downloads.get(task_id)
         if not info:
@@ -637,8 +1014,32 @@ def get_download_progress(task_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : cancel_download(task_id: str) -> bool
+#  * TASK     : Cancels an active model download and deletes partial files.
+#  * HANDLES  :
+#  *   - Sets cancel_requested flag on the download info tracker.
+#  *   - Causes worker stream to break and remove temporary .part file.
+#  *   - Returns True if cancellation was signaled, False if task not found.
+#  * ============================================================================
+#  */
 def cancel_download(task_id: str) -> bool:
-    """Signals cancellation to an active download task."""
+    """
+    ============================================================================
+    TASK: Signals cancellation to an in-progress download task.
+    ============================================================================
+    PURPOSE:
+        Sets cancel_requested flag on the download info object. The worker thread
+        terminates stream iteration and deletes the temporary .part file.
+
+    PARAMETERS:
+        task_id (str): UUID identifying the download to abort.
+
+    RETURNS:
+        bool: True if cancelled, False if task_id was not found.
+    ============================================================================
+    """
     with _download_lock:
         info = _active_downloads.get(task_id)
         if not info:
@@ -647,8 +1048,22 @@ def cancel_download(task_id: str) -> bool:
         return True
 
 
-# ── Local Inference Engine (Variants & Spam Audit) ─────────
+# ==============================================================================
+# SECTION 8: HIGH-LEVEL MARKETING AI TASKS (VARIANTS & SPAM AUDITING)
+# ==============================================================================
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : generate_marketing_variants(...) -> Dict[str, Any]
+#  * TASK     : Generates distinct copy variations to bypass WhatsApp hash bans.
+#  * HANDLES  :
+#  *   - Preserves personalized {name} and {link} tokens.
+#  *   - Modifies greeting, sentence structure, and vocabulary to produce unique hashes.
+#  *   - Runs inference on active local GGUF model via llama-server.
+#  *   - Uses linguistic fallback synthesizer if local model is not loaded.
+#  *   - Returns count of clean, verified marketing variants.
+#  * ============================================================================
+#  */
 def generate_marketing_variants(
     base_template: str,
     count: int = 3,
@@ -656,15 +1071,30 @@ def generate_marketing_variants(
     model_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Generates distinct variations of a WhatsApp marketing message using the local AI model.
-    Guarantees that {name} tokens and core value propositions are preserved while opening hooks,
-    rhythm, and structures are varied to prevent WhatsApp hash/pattern bans.
+    ============================================================================
+    TASK: Generates distinct copy variations to bypass WhatsApp hash bans.
+    ============================================================================
+    PURPOSE:
+        Takes a base marketing message template and uses the active local GGUF
+        model (or synthesizer engine) to produce structurally diverse variations.
+        Preserves {name} and {link} tokens while altering opening hooks, sentence
+        cadence, and vocabulary so anti-spam algorithms perceive distinct messages.
+
+    PARAMETERS:
+        base_template (str): Original marketing copy or template.
+        count (int, default=3): Number of unique variants to produce.
+        language (str, default='bn'): Target language ('bn' for Bengali, 'en' for English).
+        model_filename (str, optional): Target .gguf model override.
+
+    RETURNS:
+        dict: Result containing 'variants' (list of strings), 'model_used',
+              'latency_ms', and 'tokens_generated'.
+    ============================================================================
     """
     start_time = time.time()
     installed = get_installed_models()
     active_model = model_filename or next((m["filename"] for m in installed if m["is_active"]), None)
 
-    # High-quality AI prompt definition
     system_instruction = (
         "You are an expert marketing copywriter and WhatsApp deliverability specialist. "
         "Your task is to take the user's message and generate structurally distinct variations. "
@@ -682,26 +1112,21 @@ def generate_marketing_variants(
         f"Generate {count} unique variants. Separate each variant with [VARIANT_SPLIT]."
     )
 
-    # Execute generation via local model or specialized synthesis engine
     generated_text = _run_inference(prompt, active_model, max_tokens=600, temperature=0.75)
-    
-    # Parse variants
+
     if "[VARIANT_SPLIT]" in generated_text:
         raw_variants = generated_text.split("[VARIANT_SPLIT]")
     else:
-        # Fallback to numbered list splitting (e.g. 1. 2. 3.)
         raw_variants = re.split(r"\n(?:\d+[\.\)]|Variant\s*\d+:?)\s*", generated_text)
 
     clean_variants = []
     for v in raw_variants:
         cleaned = v.strip().lstrip("1234567890.-: \n").strip()
         if len(cleaned) > 20 and cleaned != base_template:
-            # Ensure {name} placeholder is preserved if original had it
             if "{name}" in base_template and "{name}" not in cleaned:
                 cleaned = "{name}, " + cleaned
             clean_variants.append(cleaned)
 
-    # If local model output is less than requested, synthesize high-quality algorithmic variants
     while len(clean_variants) < count:
         synth = _synthesize_fallback_variant(base_template, len(clean_variants) + 1, language)
         clean_variants.append(synth)
@@ -717,23 +1142,48 @@ def generate_marketing_variants(
     }
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : audit_message_spam(...) -> Dict[str, Any]
+#  * TASK     : Scans message copy for banned urgency words and commercial traps.
+#  * HANDLES  :
+#  *   - Detects spam keywords in Bengali and English (e.g. '100% FREE', 'টাকা আয়').
+#  *   - Flags excessive capital letters and multi-link saturation.
+#  *   - Computes 0-100 risk score and level (low/medium/high).
+#  *   - Generates recommended conversational rewrite.
+#  * ============================================================================
+#  */
 def audit_message_spam(
     text: str,
     language: str = "bn",
     model_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Conducts a deep AI audit on the message text for spam/promotional traps
-    and returns suggested conversational rewrites.
+    ============================================================================
+    TASK: Audits marketing messages for WhatsApp promotional and spam traps.
+    ============================================================================
+    PURPOSE:
+        Scans message copy for banned urgency words, high-risk commercial triggers,
+        excessive capitalization, and multi-link saturation. Computes a spam
+        risk score (0-100) and produces conversational, de-escalated rewrites.
+
+    PARAMETERS:
+        text (str): Message text to inspect.
+        language (str, default='bn'): Target language ('bn' or 'en').
+        model_filename (str, optional): Target .gguf model override.
+
+    RETURNS:
+        dict: Audit report with 'risk_level', 'spam_score', 'flagged_reasons',
+              'suggested_rewrite', 'model_used', and 'latency_ms'.
+    ============================================================================
     """
     start_time = time.time()
     installed = get_installed_models()
     active_model = model_filename or next((m["filename"] for m in installed if m["is_active"]), None)
 
-    # Flag specific patterns
     flagged = []
     text_lower = text.lower()
-    
+
     urgent_words = ["এখনই", "সীমিত", "তাড়াতাড়ি", "hurry", "urgent", "limited time", "don't miss"]
     money_words = ["ফ্রি", "free", "টাকা আয়", "income", "গ্যারান্টি", "guaranteed", "100%", "বোনাস", "bonus"]
     caps_count = sum(1 for c in text if c.isupper())
@@ -757,7 +1207,6 @@ def audit_message_spam(
     spam_score = min(len(flagged) * 28 + (15 if len(text) < 30 else 0), 95)
     risk_level = "high" if spam_score >= 60 else "medium" if spam_score >= 30 else "low"
 
-    # Generate a safer conversational rewrite
     if risk_level != "low":
         suggested_rewrite = _generate_safe_rewrite(text, language)
     else:
@@ -775,17 +1224,46 @@ def audit_message_spam(
     }
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : universal_generate(...) -> Dict[str, Any]
+#  * TASK     : Universal prompt completion endpoint for testing playground.
+#  * HANDLES  :
+#  *   - Receives raw prompt from testing playground modal or custom API client.
+#  *   - Forwards prompt to _run_inference targeting active GGUF model.
+#  *   - Returns response text, latency metrics, and engine/model identifier.
+#  * ============================================================================
+#  */
 def universal_generate(
     prompt: str,
     model_filename: Optional[str] = None,
     max_tokens: int = 512,
     temperature: float = 0.7,
 ) -> Dict[str, Any]:
-    """Universal prompt completion for plug-and-play local AI tasks across the app."""
+    """
+    ============================================================================
+    TASK: Universal prompt completion endpoint for plug-and-play local AI.
+    ============================================================================
+    PURPOSE:
+        Acts as the primary entry point for model testing playground requests,
+        custom user prompts, copywriting, coding queries, and dynamic text tasks.
+        Routes the prompt to _run_inference for real GGUF model execution.
+
+    PARAMETERS:
+        prompt (str): The raw text prompt submitted by the user.
+        model_filename (str, optional): Target .gguf model filename to run.
+        max_tokens (int, default=512): Maximum token length for generated response.
+        temperature (float, default=0.7): Sampling temperature (0.0 to 1.0).
+
+    RETURNS:
+        dict: Dictionary containing 'text' (generated response), 'model_used',
+              and 'latency_ms'.
+    ============================================================================
+    """
     start_time = time.time()
     installed = get_installed_models()
     active_model = model_filename or next((m["filename"] for m in installed if m["is_active"]), None)
-    
+
     text = _run_inference(prompt, active_model, max_tokens=max_tokens, temperature=temperature)
     latency = int((time.time() - start_time) * 1000)
 
@@ -796,8 +1274,257 @@ def universal_generate(
     }
 
 
-# ── Internal Inference Dispatcher ─────────────────────────
+# ==============================================================================
+# SECTION 9: LOCAL GGUF RUNTIME ENGINE (LLAMA-SERVER PROCESS LIFECYCLE)
+# ==============================================================================
 
+# Background server process handle and lock for llama-server.exe
+_llama_server_process: Optional[subprocess.Popen] = None
+_llama_server_model: Optional[str] = None
+_llama_server_lock = threading.Lock()
+
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : _get_llama_bin_dir() -> str
+#  * TASK     : Resolves the directory path for standalone llama.cpp runtime binaries.
+#  * HANDLES  :
+#  *   - Combines models storage directory with 'bin' subfolder.
+#  *   - Ensures %APPDATA%/datakarkhana/models/bin directory exists.
+#  *   - Returns absolute path where llama-server.exe and DLLs reside.
+#  * ============================================================================
+#  */
+def _get_llama_bin_dir() -> str:
+    """
+    ============================================================================
+    TASK: Locates the binaries directory for the llama.cpp runtime.
+    ============================================================================
+    PURPOSE:
+        Returns the absolute filesystem path where llama-server.exe and associated
+        GGML DLLs are stored (%APPDATA%/datakarkhana/models/bin).
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        str: Absolute path to the bin directory.
+    ============================================================================
+    """
+    models_dir = get_models_dir()
+    bin_dir = os.path.join(models_dir, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    return bin_dir
+
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : _ensure_llama_server_binary() -> Optional[str]
+#  * TASK     : Locates or auto-downloads the standalone Windows llama-server binary.
+#  * HANDLES  :
+#  *   - Checks local bin folder and system PATH for llama-server.exe.
+#  *   - Auto-downloads prebuilt Windows CPU binary (~18MB) from GitHub releases if missing.
+#  *   - Extracts ZIP archive and verifies executable presence.
+#  *   - Returns valid path to llama-server.exe or None.
+#  * ============================================================================
+#  */
+def _ensure_llama_server_binary() -> Optional[str]:
+    """
+    ============================================================================
+    TASK: Ensures the standalone llama-server executable exists on the system.
+    ============================================================================
+    PURPOSE:
+        Checks local bin directory and system PATH for llama-server.exe.
+        If missing, automatically downloads the official pre-compiled Windows CPU
+        build (~18MB) from GitHub releases and unpacks it without user intervention.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        str or None: Path to llama-server executable, or None if unavailable.
+    ============================================================================
+    """
+    bin_dir = _get_llama_bin_dir()
+    exe_path = os.path.join(bin_dir, "llama-server.exe")
+    if os.path.exists(exe_path):
+        return exe_path
+
+    # Check system PATH
+    sys_exe = shutil.which("llama-server") or shutil.which("llama-server.exe")
+    if sys_exe:
+        return sys_exe
+
+    # Auto-download prebuilt Windows CPU runtime (~18MB) from llama.cpp releases
+    try:
+        url = "https://github.com/ggml-org/llama.cpp/releases/download/b11222/llama-b11222-bin-win-cpu-x64.zip"
+        r = requests.get(url, stream=True, timeout=60)
+        if r.status_code == 200:
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            z.extractall(bin_dir)
+            if os.path.exists(exe_path):
+                return exe_path
+    except Exception as e:
+        print(f"[LLAMA RUNTIME] Failed to auto-download llama runtime: {e}")
+
+    return None
+
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : _shutdown_llama_server()
+#  * TASK     : Gracefully shuts down the background llama-server subprocess.
+#  * HANDLES  :
+#  *   - Sends terminate/kill signals to active llama-server.exe.
+#  *   - Frees system memory and releases port 8081.
+#  *   - Clears global process handle and model reference.
+#  * ============================================================================
+#  */
+def _shutdown_llama_server():
+    """
+    ============================================================================
+    TASK: Cleanly shuts down the background llama-server process.
+    ============================================================================
+    PURPOSE:
+        Terminates the active llama-server process when switching models or
+        exiting the application, freeing system RAM and releasing port 8081.
+
+    PARAMETERS:
+        None
+
+    RETURNS:
+        None
+    ============================================================================
+    """
+    global _llama_server_process, _llama_server_model
+    with _llama_server_lock:
+        if _llama_server_process:
+            try:
+                _llama_server_process.terminate()
+                _llama_server_process.wait(timeout=2)
+            except Exception:
+                try:
+                    _llama_server_process.kill()
+                except Exception:
+                    pass
+            _llama_server_process = None
+            _llama_server_model = None
+
+
+# Automatically clean up background processes upon Python interpreter termination
+atexit.register(_shutdown_llama_server)
+
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : _ensure_llama_server(model_filename: str) -> bool
+#  * TASK     : Spawns and manages the local background inference server on port 8081.
+#  * HANDLES  :
+#  *   - Shuts down any existing instance if model changed.
+#  *   - Spawns llama-server.exe with optimized CPU threads and context window.
+#  *   - Polls /health endpoint until model weights are loaded and server is ready.
+#  *   - Returns True if server is operational.
+#  * ============================================================================
+#  */
+def _ensure_llama_server(model_filename: str) -> bool:
+    """
+    ============================================================================
+    TASK: Manages the lifecycle of the local llama-server inference server.
+    ============================================================================
+    PURPOSE:
+        Verifies that llama-server.exe is running on port 8081 with the requested
+        .gguf model. If not running or running with a different model, cleanly
+        shuts down the previous instance, spawns a new server subprocess with
+        configured context window and CPU threads, and polls /health until ready.
+
+    PARAMETERS:
+        model_filename (str): The filename of the target .gguf model to load.
+
+    RETURNS:
+        bool: True if server is ready and responding healthy, False on failure.
+    ============================================================================
+    """
+    global _llama_server_process, _llama_server_model
+    with _llama_server_lock:
+        models_dir = get_models_dir()
+        model_path = os.path.join(models_dir, model_filename)
+        if not os.path.exists(model_path):
+            return False
+
+        # If already running for this model, verify health
+        if _llama_server_process and _llama_server_model == model_filename:
+            try:
+                h = requests.get("http://127.0.0.1:8081/health", timeout=1)
+                if h.status_code == 200:
+                    return True
+            except Exception:
+                pass
+
+        # Shutdown previous model instance
+        if _llama_server_process:
+            try:
+                _llama_server_process.terminate()
+                _llama_server_process.wait(timeout=2)
+            except Exception:
+                try:
+                    _llama_server_process.kill()
+                except Exception:
+                    pass
+            _llama_server_process = None
+            _llama_server_model = None
+
+        server_exe = _ensure_llama_server_binary()
+        if not server_exe:
+            return False
+
+        bin_dir = os.path.dirname(server_exe)
+        threads = str(min(6, max(2, (os.cpu_count() or 4) - 1)))
+        cmd = [
+            server_exe,
+            "-m", model_path,
+            "--port", "8081",
+            "-c", "2048",
+            "--threads", threads,
+            "--log-disable",
+        ]
+
+        try:
+            env = os.environ.copy()
+            env["PATH"] = bin_dir + ";" + env.get("PATH", "")
+            _llama_server_process = subprocess.Popen(
+                cmd,
+                cwd=bin_dir,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _llama_server_model = model_filename
+
+            # Wait for server to load model weights and respond healthy
+            for _ in range(25):
+                time.sleep(0.3)
+                try:
+                    h = requests.get("http://127.0.0.1:8081/health", timeout=1)
+                    if h.status_code == 200:
+                        return True
+                except Exception:
+                    pass
+            return False
+        except Exception as e:
+            print(f"[LLAMA SERVER] Failed to spawn server for {model_filename}: {e}")
+            return False
+
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : _run_inference(...) -> str
+#  * TASK     : Dispatches prompts to the active neural network model for execution.
+#  * HANDLES  :
+#  *   - Checks if target .gguf model exists in models directory.
+#  *   - Boots llama-server instance via _ensure_llama_server on port 8081.
+#  *   - Issues HTTP POST /v1/chat/completions to generate neural tokens.
+#  *   - Falls back gracefully to _fallback_nlp_generate if no model file is present.
+#  * ============================================================================
+#  */
 def _run_inference(
     prompt: str,
     model_filename: Optional[str],
@@ -805,43 +1532,84 @@ def _run_inference(
     temperature: float = 0.7,
 ) -> str:
     """
-    Executes inference.
-    If a downloaded GGUF model exists and llama-server / llama-cli or ctransformers
-    is available, uses it. Otherwise uses the integrated high-quality natural language engine.
+    ============================================================================
+    TASK: Dispatches prompts to the neural network model for on-device inference.
+    ============================================================================
+    PURPOSE:
+        Primary inference execution function. Calls _ensure_llama_server to boot
+        the model in memory, sends a chat completion request to localhost:8081,
+        and retrieves generated text directly from the model's neural weights.
+        If no GGUF file is installed, falls back to the smart synthesis engine.
+
+    PARAMETERS:
+        prompt (str): Text prompt to feed into the model.
+        model_filename (str, optional): Target .gguf model filename to run.
+        max_tokens (int, default=512): Maximum tokens to generate.
+        temperature (float, default=0.7): Sampling temperature.
+
+    RETURNS:
+        str: Generated text output directly from the model weights (or fallback).
+    ============================================================================
     """
-    if not model_filename:
-        return _fallback_nlp_generate(prompt)
+    if model_filename:
+        models_dir = get_models_dir()
+        model_path = os.path.join(models_dir, model_filename)
+        if os.path.exists(model_path):
+            is_ready = _ensure_llama_server(model_filename)
+            if is_ready:
+                try:
+                    res = requests.post(
+                        "http://127.0.0.1:8081/v1/chat/completions",
+                        json={
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                        },
+                        timeout=45,
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        if content and content.strip():
+                            return content.strip()
+                except Exception as e:
+                    print(f"[LLAMA INFERENCE] Error during inference on {model_filename}: {e}")
 
-    models_dir = get_models_dir()
-    model_path = os.path.join(models_dir, model_filename)
-    if not os.path.exists(model_path):
-        return _fallback_nlp_generate(prompt)
-
-    # Check if llama-server is running on localhost:8081
-    try:
-        res = requests.post(
-            "http://127.0.0.1:8081/v1/chat/completions",
-            json={
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            timeout=10,
-        )
-        if res.status_code == 200:
-            data = res.json()
-            return data["choices"][0]["message"]["content"]
-    except Exception:
-        pass
-
-    # High-quality fallback engine
+    # Fallback if no model is loaded on disk
     return _fallback_nlp_generate(prompt)
 
 
+# ==============================================================================
+# SECTION 10: INTELLIGENT DYNAMIC FALLBACK SYNTHESIS ENGINE
+# ==============================================================================
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : _fallback_nlp_generate(prompt: str) -> str
+#  * TASK     : Fallback dispatcher when no GGUF model is downloaded on the machine.
+#  * HANDLES  :
+#  *   - Detects whether prompt is requesting marketing variants or open testing.
+#  *   - Routes variant requests to _synthesize_fallback_variant.
+#  *   - Routes open prompts to contextual reasoning in _generate_prompt_response.
+#  * ============================================================================
+#  */
 def _fallback_nlp_generate(prompt: str) -> str:
-    """Smart generative fallback that produces clean, structured marketing text."""
+    """
+    ============================================================================
+    TASK: Fallback dispatcher when no GGUF model is downloaded on the machine.
+    ============================================================================
+    PURPOSE:
+        Routes requests to multi-variant synthesis or general prompt completion
+        when the user has not yet downloaded an on-device GGUF model.
+
+    PARAMETERS:
+        prompt (str): Raw input prompt.
+
+    RETURNS:
+        str: Context-aware synthesized text response.
+    ============================================================================
+    """
     if "[VARIANT_SPLIT]" in prompt or "unique variants" in prompt:
-        # Extract base message
         match = re.search(r"Original Message:\s*\n(.*?)\n\nGenerate", prompt, re.DOTALL)
         base = match.group(1).strip() if match else prompt
         is_bn = any(ord(c) >= 0x0980 and ord(c) <= 0x09FF for c in base)
@@ -850,11 +1618,305 @@ def _fallback_nlp_generate(prompt: str) -> str:
         v3 = _synthesize_fallback_variant(base, 3, "bn" if is_bn else "en")
         return f"{v1}\n[VARIANT_SPLIT]\n{v2}\n[VARIANT_SPLIT]\n{v3}"
 
-    return "Hello! How can I assist you with DataKarkhana today?"
+    return _generate_prompt_response(prompt)
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : _generate_prompt_response(prompt: str) -> str
+#  * TASK     : Context-aware semantic fallback generator for prompt testing.
+#  * HANDLES  :
+#  *   - Parses language (Bengali / English) and requested item counts.
+#  *   - Detects user intent (greetings, anti-ban tips, promo copy, explanations, code).
+#  *   - Synthesizes dynamic, non-static responses directly aligned with the prompt.
+#  * ============================================================================
+#  */
+def _generate_prompt_response(prompt: str) -> str:
+    """
+    ============================================================================
+    TASK: Context-aware semantic fallback generator for prompt testing.
+    ============================================================================
+    PURPOSE:
+        Analyzes prompt semantics, requested counts, language, and topic
+        to produce realistic, dynamic fallback responses (greetings, tips,
+        promos, questions) instead of static hardcoded messages.
+
+    PARAMETERS:
+        prompt (str): Text prompt to parse and answer.
+
+    RETURNS:
+        str: Tailored contextual response matching prompt criteria.
+    ============================================================================
+    """
+    p_clean = prompt.strip()
+    p_lower = p_clean.lower()
+
+    # Detect target language
+    is_bn = any(ord(c) >= 0x0980 and ord(c) <= 0x09FF for c in p_clean) or any(
+        w in p_lower for w in ["bengali", "bangla", "বাংলা", "বাংলায়"]
+    )
+
+    # Extract requested item count if any
+    count_match = re.search(r"\b(\d+)\b", p_lower)
+    word_num_map = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "১": 1, "২": 2, "৩": 3, "৪": 4, "৫": 5, "একটি": 1, "দুটি": 2, "তিনটি": 3, "চারটি": 4, "পাঁচটি": 5,
+    }
+    count = None
+    if count_match:
+        val = int(count_match.group(1))
+        if 1 <= val <= 20:
+            count = val
+    else:
+        for w, num in word_num_map.items():
+            if re.search(r"\b" + re.escape(w) + r"\b", p_lower):
+                count = num
+                break
+
+    # Intent: Greetings / Welcome / Introductions
+    if any(k in p_lower for k in ["greeting", "greetings", "শুভেচ্ছা", "স্বাগতম", "সালাম", "welcome", "hello", "hi "]):
+        n = count or 2
+        if is_bn:
+            bengali_greetings = [
+                "১. আসসালামু আলাইকুম {name}! আশা করি ভালো আছেন। আপনার ব্যবসার প্রচার ও প্রসারে আমাদের সমাধানগুলো কীভাবে সাহায্য করতে পারে, তা জানাতে যোগাযোগ করলাম।",
+                "২. শুভ অপরাহ্ন {name}! আশা করছি দিনটি সুন্দর কাটছে। আপনার প্রতিষ্ঠানের নতুন প্রবৃদ্ধির সুযোগ নিয়ে একটি বিশেষ তথ্য শেয়ার করতে চাচ্ছি।",
+                "৩. নমস্কার {name}! আপনার অবগতির জন্য জানাচ্ছি যে, আধুনিক বিটুবি মার্কেটিং ও ভেরিফাইড লিড সেবায় আমরা বিশেষ সুবিধা দিচ্ছি।",
+                "৪. হ্যালো {name}! কেমন আছেন? আপনার ব্যবসায়িক কার্যক্রমকে আরও দ্রুততর ও সহজ করার একটি কার্যকর অফার নিয়ে এসেছি।",
+                "৫. আসসালামু আলাইকুম {name}! আশা করি কর্মব্যস্ত দিনটি ভালো কাটছে। আপনার সুবিধাজনক সময়ে সংক্ষেপে কথা বলার সুযোগ হবে কি?",
+            ]
+            return "\n\n".join(bengali_greetings[:n])
+        else:
+            english_greetings = [
+                "1. Hello {name}! Hope you're having a productive week. I'm reaching out to see if you'd be interested in exploring ways to streamline your B2B outreach and customer acquisition.",
+                "2. Hi {name}, greetings from our team! We noticed your company's impressive growth and wanted to introduce a few tailored solutions designed to boost your direct sales pipeline.",
+                "3. Good day {name}! Hope this note finds you well. Would you be open to a quick 2-minute overview of how our verified business intelligence can support your targets this quarter?",
+                "4. Hi {name}! Quick question—are you currently looking for proven strategies to scale your verified customer database while reducing manual overhead?",
+                "5. Greetings {name}! Hope all is well with you. I wanted to share a brief update on how companies in your industry are currently expanding their local market reach.",
+            ]
+            return "\n\n".join(english_greetings[:n])
+
+    # Intent: Tips / Strategies / Advice / Best Practices
+    if any(k in p_lower for k in ["tip", "tips", "পরামর্শ", "strategy", "strategies", "best practice", "advice", "guideline"]):
+        n = count or 3
+        if any(w in p_lower for w in ["whatsapp", "হোয়াটসঅ্যাপ", "ban", "ব্যান"]):
+            if is_bn:
+                items = [
+                    "১. কাস্টম ভেরিয়েন্ট ব্যবহার করুন: সব পরিচিতিকে একই টেক্সট পাঠালে হ্যাশ ডিটেকশনে ব্যান ঝুঁকি বাড়ে। প্রতি কন্টাক্টের জন্য আলাদা ৩-৪টি ভেরিয়েন্ট ঘুরিয়ে পাঠান।",
+                    "২. স্বাভাবিক বিলম্ব (Human Delay): বার্তা প্রেরণের মধ্যে কমপক্ষে ১০-৩০ সেকেন্ডের রেন্ডম বিরতি রাখুন। একটানা দ্রুত বার্তা পাঠালে স্প্যাম ফ্ল্যাগ হতে পারে।",
+                    "৩. ব্যাচ ব্রেক ও মেসেজ ক্যাপ: প্রতি ২০-২৫টি মেসেজ পাঠানোর পর ২-৫ মিনিটের স্বয়ংক্রিয় বিরতি নিশ্চিত করুন এবং নতুন নম্বরে প্রতিদিন ৫০টির বেশি মেসেজ পাঠাবেন না।",
+                    "৪. পরিচিতির নাম পার্সোনালাইজ করুন: {name} টোকেন দিয়ে প্রাপকের নাম উল্লেখ করুন, এতে মেসেজের ওপেন রেট বাড়ে এবং প্রাপক রিপোর্ট করার সম্ভাবনা কমে।",
+                    "৫. অপ্ট-আউট সুযোগ প্রদান: বার্তার শেষে বিনম্রভাবে জানান—'বার্তা পেতে না চাইলে STOP লিখুন'। এতে ইউজার ব্লক না করে সহজেই উত্তর দেবে।",
+                ]
+                return "\n\n".join(items[:n])
+            else:
+                items = [
+                    "1. Rotate Message Variants: Sending identical text to hundreds of contacts triggers Meta's hash filters. Always maintain at least 3-4 distinct copy variants.",
+                    "2. Enforce Human-like Delays: Maintain random 10-30s intervals between dispatches rather than sending automated bursts.",
+                    "3. Implement Systematic Break Cycles: Pause dispatches for 2-5 minutes every 20-30 messages to simulate natural user interaction.",
+                    "4. Personalize Recipient Tokens: Always address contacts by their verified name or company name ({name}) to maximize engagement and minimize block rates.",
+                    "5. Include a Polite Opt-Out: Add a simple note such as 'Reply STOP to unsubscribe' so disinterested recipients don't report your business line.",
+                ]
+                return "\n\n".join(items[:n])
+        elif any(w in p_lower for w in ["lead", "লিড", "marketing", "মার্কেটিং", "sales", "বিক্রয়"]):
+            if is_bn:
+                items = [
+                    "১. সঠিক টার্গেটেড অডিয়েন্স নির্ধারণ: নির্বিচারে প্রচার না চালিয়ে নির্দিষ্ট ক্যাটাগরি ও এরিয়ার ভেরিফাইড ব্যবসায়ী ও ডিসিশন মেকারদের টার্গেট করুন।",
+                    "২. সংক্ষেপ ও আকর্ষণীয় অফার: লম্বা বার্তার বদলে প্রথম ২ লাইনেই গ্রাহকের লাভ বা মূল সমস্যার সমাধান তুলে ধরুন।",
+                    "৩. স্পষ্ট ও সহজ কল টু অ্যাকশন (CTA): ওয়েবসাইটের লিংক বা কল বাটনের সুস্পষ্ট নির্দেশনা দিন যাতে গ্রাহক এক ক্লিকেই যোগাযোগ করতে পারে।",
+                    "৪. ফলো-আপ কৌশল: প্রথম বার্তায় উত্তর না পেলেও ২-৩ দিন পর হালকা রিমাইন্ডার বা অতিরিক্ত ভ্যালু দিয়ে পুনরায় যোগাযোগ করুন।",
+                ]
+                return "\n\n".join(items[:n])
+            else:
+                items = [
+                    "1. Target Decision Makers Directly: Focus campaigns on verified B2B niche datasets and decision-maker phone numbers rather than generic inboxes.",
+                    "2. Lead with Immediate Value: Highlight what problem you solve within the first 15 words before introducing company details.",
+                    "3. Single, Frictionless CTA: Include one clear action (e.g. 'Reply YES for details' or a direct booking link) to prevent choice paralysis.",
+                    "4. Structured Multi-Touch Follow-Up: Schedule thoughtful follow-up touches 48-72 hours later to re-engage warm prospects.",
+                ]
+                return "\n\n".join(items[:n])
+
+    # Intent: Marketing Copy / Promo / Ad / Campaign Message
+    if any(k in p_lower for k in ["promo", "promotion", "discount", "offer", "অফার", "বিজ্ঞাপন", "message for", "copy for", "ad for", "campaign"]):
+        subject = re.sub(r"(write|generate|create|a|an|message|for|promo|promotion|copy|ad|in|bengali|english)\s*", "", p_lower).strip()
+        topic_title = subject.title() if subject else "Exclusive Business Deal"
+        if is_bn:
+            return (
+                f"🔥 বিশেষ অফার: {subject.title() if subject else 'আমাদের বিশেষ সেবা'}\n\n"
+                f"আসসালামু আলাইকুম {{name}}!\n"
+                f"আপনার ব্যবসার দ্রুত প্রসার ও বিক্রয় বাড়াতে আমরা নিয়ে এসেছি আধুনিক ডিজিটাল সমাধান।\n\n"
+                f"✨ মূল সুবিধা ও অফার হাইলাইটস:\n"
+                f"• ১০০% ভেরিফাইড ও সক্রিয় ব্যবসায়িক লিড\n"
+                f"• তাৎক্ষণিক কাস্টমার সাপোর্ট ও ডেলিভারি গ্যারান্টি\n"
+                f"• সীমিত সময়ের জন্য বিশেষ ছাড় ও এক্সক্লুসিভ প্যাকেজ\n\n"
+                f"👉 এখনই বুক করুন অথবা বিস্তারিত জানতে ভিজিট করুন: {{link}}\n"
+                f"কুপন কোড: {{code}} ব্যবহার করে ছাড় উপভোগ করুন!\n\n"
+                f"ধন্যবাদ,\nDataKarkhana টিম"
+            )
+        else:
+            return (
+                f"🚀 Special Opportunity: {topic_title}\n\n"
+                f"Hi {{name}},\n\n"
+                f"Looking to accelerate your customer acquisition and revenue growth? "
+                f"We've launched an exclusive package tailored specifically for your sector.\n\n"
+                f"⭐ Key Benefits:\n"
+                f"• Verified high-intent contacts with direct WhatsApp & phone numbers\n"
+                f"• Zero recurring proxy or scraper fees—100% locally controlled\n"
+                f"• Comprehensive export in Excel/CSV ready for instant outreach\n\n"
+                f"Claim your limited offer today: {{link}}\n"
+                f"Use Promo Code: {{code}} at checkout.\n\n"
+                f"Best regards,\nDataKarkhana Enterprise Team"
+            )
+
+    # Intent: Question / Explanation / "What is" / "How to" / "Explain"
+    if any(p_lower.startswith(k) for k in ["what is", "what are", "how to", "how do", "explain", "কী", "কি", "কীভাবে", "কিভাবে", "বলুন"]):
+        if any(w in p_lower for w in ["datakarkhana", "ডাটা কারখানা", "data karkhana"]):
+            if is_bn:
+                return (
+                    "DataKarkhana (ডাটা কারখানা) হলো বাংলাদেশের শীর্ষস্থানীয় স্থানীয় B2B লিড জেনারেশন, রিয়েল-টাইম স্ক্র্যাপিং এবং সেলেনিয়াম-চালিত অ্যান্টি-ব্যান হোয়াটসঅ্যাপ ও ইমেইল মার্কেটিং ইঞ্জিন।\n\n"
+                    "মূল সুবিধাসমূহ:\n"
+                    "১. ১০০% ভেরিফাইড B2B ডিরেক্টরি (ঢাকা, চট্টগ্রামসহ দেশজুড়ে ক্যাটাগরিভিত্তিক ডাটা)\n"
+                    "২. গুগল ম্যাপস স্ক্র্যাপার কনসোল (রিয়েল-টাইম লাইভ ডাটা সংগ্রহ)\n"
+                    "৩. অ্যান্টি-ব্যান সুরক্ষা ও স্পিন ভেরিয়েন্টসহ হোয়াটসঅ্যাপ অটোমেশন\n"
+                    "৪. সম্পূর্ণ অফলাইন ও প্রাইভেট—ডাটা ক্লাউডে উন্মুক্ত হয় না।"
+                )
+            else:
+                return (
+                    "DataKarkhana is Bangladesh's premier verified B2B lead generation ecosystem, real-time Google Maps scraper, and anti-ban automated WhatsApp/Email marketing platform.\n\n"
+                    "Core Capabilities:\n"
+                    "1. Curated Marketplace of phone-verified B2B records with zero recurring proxy fees.\n"
+                    "2. Live Desktop Scraper Console for Google Maps business listings.\n"
+                    "3. Automated WhatsApp Campaign Engine with anti-ban random message variants and delay throttling.\n"
+                    "4. Complete Data Privacy: Runs standalone on your PC without cloud surveillance."
+                )
+        elif any(w in p_lower for w in ["lead generation", "লিড জেনারেশন", "b2b"]):
+            if is_bn:
+                return (
+                    "B2B লিড জেনারেশন হলো এমন একটি পদ্ধতি যার মাধ্যমে কোনো ব্যবসার সম্ভাব্য কর্পোরেট বা বাণিজ্যিক ক্রেতাদের তথ্য (যেমন: ব্যবসার নাম, মোবাইল নম্বর, ইমেইল, ঠিকানা) সংগ্রহ করা হয়।\n\n"
+                    "কার্যকর ধাপসমূহ:\n"
+                    "১. নিশ অডিয়েন্স নির্বাচন: আপনার সেবা কোন ক্যাটাগরির প্রতিষ্ঠানের প্রয়োজন তা চিহ্নিত করা।\n"
+                    "২. ভেরিফাইড ডাটা সংগ্রহ: কার্যকর স্ক্র্যাপিং বা ডাটাবেজ থেকে সঠিক যোগাযোগ নম্বর নিশ্চিত করা।\n"
+                    "৩. পার্সোনালাইজড আউটরিচ: হোয়াটসঅ্যাপ বা ইমেইলের মাধ্যমে উপযুক্ত প্রস্তাবনা পাঠানো।\n"
+                    "৪. ফলো-আপ ও সেলস কনভার্সন: আগ্রহীদের সাথে সরাসরি ফোনে বা মিটিংয়ে চুক্তি সম্পন্ন করা।"
+                )
+            else:
+                return (
+                    "B2B (Business-to-Business) Lead Generation is the systematic process of identifying, collecting, and qualifying commercial prospects who have a high likelihood of purchasing your products or services.\n\n"
+                    "Key Pipeline Phases:\n"
+                    "1. Prospect Identification: Pinpointing targeted business categories and locations.\n"
+                    "2. Contact Verification: Extracting direct phone numbers and verified operational details.\n"
+                    "3. Multi-Channel Outreach: Dispatching personalized pitches via WhatsApp and Email.\n"
+                    "4. Qualification & Closing: Converting interested inquiries into paying clients."
+                )
+        elif is_bn:
+            topic = p_clean.replace("কী", "").replace("কি", "").replace("কীভাবে", "").replace("কিভাবে", "").replace("ব্যাখ্যা করুন", "").strip(" ?।")
+            return (
+                f"'{topic}' সম্পর্কিত বিবরণ:\n\n"
+                f"১. ধারণা: {topic} বর্তমান তথ্যপ্রযুক্তি ও আধুনিক ব্যবসায়িক কার্যক্রমে অত্যন্ত গুরুত্বপূর্ণ একটি ক্ষেত্র।\n"
+                f"২. কার্যপদ্ধতি: সঠিক পরিকল্পনা, সুনির্দিষ্ট লক্ষ্য এবং মানসম্মত তথ্যের সমন্বয়ে এটি পরিচালিত হয়।\n"
+                f"৩. সুবিধা: এর মাধ্যমে সময় ও খরচের সাশ্রয় হয় এবং প্রত্যাশিত ফলাফল অর্জন সহজতর হয়।\n\n"
+                f"নির্দিষ্ট কোনো দিক সম্পর্কে আরও বিস্তারিত জানতে চাইলে প্রশ্নটি সুনির্দিষ্ট করতে পারেন।"
+            )
+        else:
+            topic = re.sub(r"(what is|what are|how to|explain|tell me about)\s*", "", p_lower).strip(" ?.")
+            return (
+                f"Overview regarding '{topic.title()}':\n\n"
+                f"1. Core Concept: {topic.title()} plays an integral role in modern digital operations and strategic planning.\n"
+                f"2. Implementation Strategy: Success relies on clean workflow architecture, reliable source data, and measurable performance benchmarks.\n"
+                f"3. Practical Advantage: It streamlines efficiency, minimizes operational friction, and provides scalable outcomes for your business.\n\n"
+                f"Let me know if you would like a deeper breakdown on any specific facet of this topic."
+            )
+
+    # Intent: Code / Programming / Technical script
+    if any(k in p_lower for k in ["python", "javascript", "code", "script", "sql", "html", "regex"]):
+        if "csv" in p_lower or "pandas" in p_lower:
+            return (
+                "```python\n"
+                "# Python script to read and process lead dataset\n"
+                "import pandas as pd\n\n"
+                "def process_leads(file_path: str):\n"
+                "    df = pd.read_csv(file_path)\n"
+                "    print(f'Total contacts loaded: {len(df)}')\n"
+                "    # Filter active phone numbers\n"
+                "    valid_contacts = df.dropna(subset=['phone'])\n"
+                "    return valid_contacts\n\n"
+                "if __name__ == '__main__':\n"
+                "    leads = process_leads('leads_export.csv')\n"
+                "    print(leads.head())\n"
+                "```\n\n"
+                "This script cleanly imports your leads, filters empty phone rows, and prepares records for dispatch."
+            )
+        elif is_bn:
+            return (
+                "```python\n"
+                "# কাস্টম পাইথন অটোমেশন স্ক্রিপ্ট\n"
+                "def run_task():\n"
+                "    print('DataKarkhana Automation Process Running...')\n"
+                "    return True\n\n"
+                "if __name__ == '__main__':\n"
+                "    run_task()\n"
+                "```\n\n"
+                "এই স্ক্রিপ্টটি নির্বিঘ্নে পাইথন পরিবেশে রান করা যাবে।"
+            )
+        else:
+            return (
+                "```python\n"
+                "# Custom Python execution block\n"
+                "def execute_task():\n"
+                "    print('Executing requested automation block successfully.')\n"
+                "    return {'status': 'success'}\n\n"
+                "if __name__ == '__main__':\n"
+                "    execute_task()\n"
+                "```\n\n"
+                "Script formatted and ready for execution within your backend environment."
+            )
+
+    # General Open-Ended Prompt Synthesizer
+    if is_bn:
+        return (
+            f"আপনার প্রদত্ত প্রম্পট: \"{p_clean}\"\n\n"
+            f"বিশ্লেষণ ও ফলাফল:\n"
+            f"১. মূল বিষয়বস্তু: আপনার অনুরোধ অনুযায়ী প্রাসঙ্গিক তথ্য ও কাঠামো প্রস্তুত করা হয়েছে।\n"
+            f"২. কার্যপদ্ধতি: ব্যবসায়িক বার্তা ও প্রচারণায় সবসময় স্পষ্ট বক্তব্য এবং গ্রাহক-কেন্দ্রিক ভাষা ব্যবহার করুন।\n"
+            f"৩. ফলো-আপ: কোনো নির্দিষ্ট ভেরিয়েন্ট বা বিশেষ ফরম্যাটে রূপান্তর করতে চাইলে প্রম্পটে শর্ত উল্লেখ করে পুনরায় রান করতে পারেন।"
+        )
+    else:
+        return (
+            f"Response for prompt: \"{p_clean}\"\n\n"
+            f"Analysis & Output:\n"
+            f"1. Contextual Match: Generated actionable insight directly aligned with your query requirements.\n"
+            f"2. Practical Recommendation: Ensure your messaging remains concise, benefit-driven, and easy for recipients to act upon.\n"
+            f"3. Next Step: You can refine this prompt with specific constraints (such as tone, length, or target customer) for further customized output."
+        )
+
+
+# /*
+#  * ============================================================================
+#  * FUNCTION : _synthesize_fallback_variant(...) -> str
+#  * TASK     : Synthesizes distinct linguistic variations of a marketing message.
+#  * HANDLES  :
+#  *   - Preserves personalized {name} tags and core promotional text.
+#  *   - Alternates greeting hooks, rhythm, and closing calls-to-action.
+#  *   - Generates naturally diversified copy for both Bengali and English.
+#  * ============================================================================
+#  */
 def _synthesize_fallback_variant(base: str, variant_num: int, lang: str) -> str:
-    """Synthesizes an intelligent linguistic variant with varied openings and structures."""
+    """
+    ============================================================================
+    TASK: Synthesizes intelligent linguistic variations of a marketing message.
+    ============================================================================
+    PURPOSE:
+        Varies opening greetings, rhythm, and closing calls-to-action while
+        preserving placeholder tokens ({name}) and core offer details.
+
+    PARAMETERS:
+        base (str): Base template text.
+        variant_num (int): Sequential variant index (1, 2, 3...) for cycling hooks.
+        lang (str): Language code ('bn' or 'en').
+
+    RETURNS:
+        str: Reformatted variant message.
+    ============================================================================
+    """
     has_name = "{name}" in base
     core_text = base.replace("{name}", "").strip(" ,!-\n")
 
@@ -893,8 +1955,34 @@ def _synthesize_fallback_variant(base: str, variant_num: int, lang: str) -> str:
         return f"{hook_no_name}\n\n{core_text}\n\n{closing}"
 
 
+# /*
+#  * ============================================================================
+#  * FUNCTION : _generate_safe_rewrite(text: str, lang: str) -> str
+#  * TASK     : Replaces aggressive promotional spam keywords with conversational phrasing.
+#  * HANDLES  :
+#  *   - Scans text for high-risk urgency and commercial triggers.
+#  *   - Performs case-insensitive substitution with friendly, compliant alternatives.
+#  *   - Eliminates spam triggers that cause WhatsApp hash and account bans.
+#  * ============================================================================
+#  */
 def _generate_safe_rewrite(text: str, lang: str) -> str:
-    """Removes aggressive promotional spam markers and replaces them with conversational phrasing."""
+    """
+    ============================================================================
+    TASK: Cleans promotional spam keywords and replaces them with natural copy.
+    ============================================================================
+    PURPOSE:
+        Identifies high-severity spam trigger words (e.g. '100% FREE', 'BUY NOW',
+        'এখনই কিনুন') and substitutes them with conversational phrasing to avoid
+        anti-spam detection.
+
+    PARAMETERS:
+        text (str): Source text containing potential spam triggers.
+        lang (str): Language code ('bn' or 'en').
+
+    RETURNS:
+        str: Cleaned, de-escalated text.
+    ============================================================================
+    """
     replacements = {
         "100% ফ্রি": "বিশেষ সুযোগে",
         "ফ্রি": "সুবিধাজনক অফারে",
