@@ -16,6 +16,7 @@ from scraper import (
     add_job_log,
 )
 from scrapers.daraz_scraper import DarazScraper, save_daraz_to_excel
+from scrapers.generic_ecommerce_scraper import GenericEcommerceScraper, save_ecommerce_to_excel, SUPPORTED_PLATFORMS
 
 def run_background_scrape(job_id, queries, division, district, area, headless=False):
     def log_cb(msg):
@@ -168,6 +169,89 @@ def run_background_daraz_scrape(
         db.commit()
         db.close()
         log_cb("Daraz Scraper execution finished: 0 products collected.")
+
+    publish_scraper_event(job_id, {
+        "type": "job_ended",
+        "status": final_status,
+        "result_count": len(all_results)
+    })
+    clear_job_stop(job_id)
+
+
+def run_background_ecommerce_scrape(
+    job_id: int,
+    url: Optional[str] = None,
+    query: Optional[str] = None,
+    platform: Optional[str] = "generic",
+    pages: int = 1,
+    max_items: Optional[int] = None,
+    headless: bool = True
+):
+    """
+    Run automated Universal E-Commerce background scraper with live screenshot debugging,
+    WebSocket progress streaming, and private catalogue Excel output.
+    """
+    def log_cb(msg):
+        add_job_log(job_id, msg)
+        try:
+            db = get_db()
+            db.execute("INSERT INTO scrape_logs (job_id, message) VALUES (?, ?)", (job_id, msg))
+            db.commit()
+            db.close()
+        except Exception:
+            pass
+
+    scraper = GenericEcommerceScraper(job_id=job_id, log_cb=log_cb, enable_frames=True)
+    all_results = []
+    stopped_early = False
+    platform_name = SUPPORTED_PLATFORMS.get(platform, {}).get("name") if platform else "E-Commerce"
+
+    try:
+        log_cb(f"🚀 Initializing Universal E-Commerce Engine (Target: '{url or platform}', Query: '{query}', Max Pages: {pages})...")
+        all_results = scraper.run_ecommerce(
+            url=url,
+            query=query,
+            platform=platform,
+            max_pages=pages,
+            max_items=max_items,
+            headless=headless
+        )
+        if is_job_stopped(job_id):
+            stopped_early = True
+    except Exception as ex:
+        log_cb(f"⚠️ Universal E-Commerce Scraper encountered error: {ex}")
+    finally:
+        clear_scraper_frame(job_id)
+
+    # Save results to Excel even if interrupted early
+    if all_results:
+        filename = f"job_ecommerce_{job_id}_{int(time.time())}.xlsx"
+        result_path = os.path.join(SCRAPE_RESULTS_FOLDER, filename)
+        saved_count = save_ecommerce_to_excel(all_results, result_path, platform_name=platform_name or "E-Commerce")
+        if saved_count is None:
+            saved_count = len(all_results)
+
+        final_status = "stopped" if stopped_early else "done"
+        db = get_db()
+        db.execute(
+            "UPDATE scrape_jobs SET status = ?, result_path = ?, result_count = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (final_status, result_path, saved_count, job_id)
+        )
+        db.commit()
+        db.close()
+
+        status_msg = "stopped manually" if stopped_early else f"completed scanning {pages} pages"
+        log_cb(f"🎉 Universal E-Commerce Engine {status_msg}! Preserved {saved_count} products into your private catalogue.")
+    else:
+        final_status = "stopped" if stopped_early else "failed"
+        db = get_db()
+        db.execute(
+            "UPDATE scrape_jobs SET status = ?, error_message = 'No products parsed from target e-commerce store before process ended.' WHERE id = ?",
+            (final_status, job_id)
+        )
+        db.commit()
+        db.close()
+        log_cb("Universal E-Commerce Scraper execution finished: 0 products collected.")
 
     publish_scraper_event(job_id, {
         "type": "job_ended",

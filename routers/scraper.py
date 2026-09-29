@@ -16,9 +16,10 @@ from core.constants import UPLOAD_FOLDER, SCRAPE_RESULTS_FOLDER, SCRAPER_SCREENS
 from core.security import decode_jwt_token
 from core.dependencies import get_current_user, check_desktop_license, get_user_plan_tier, get_user_effective_permissions
 from services.email_service import send_custom_notification
-from services.scraper_service import run_background_scrape, run_background_daraz_scrape
+from services.scraper_service import run_background_scrape, run_background_daraz_scrape, run_background_ecommerce_scrape
 from services.marketing_service import resolve_any_recipient_group
-from schemas.scraper import ScrapeRequest, DarazScrapeRequest
+from schemas.scraper import ScrapeRequest, DarazScrapeRequest, GenericEcommerceScrapeRequest
+from scrapers.generic_ecommerce_scraper import SUPPORTED_PLATFORMS
 from schemas.datasets import DatasetRequestCreate, DatasetRequestStatusUpdate
 from scraper import (
     stop_scraper_job,
@@ -229,6 +230,100 @@ def get_daraz_jobs(current_user: dict = Depends(get_current_user)):
     return [dict(j) for j in jobs]
 
 
+@router.get("/api/scraper/ecommerce/platforms")
+def get_supported_ecommerce_platforms():
+    """Return configured platform presets and sample patterns for plug-and-play UI"""
+    return [
+        {
+            "id": k,
+            "name": v["name"],
+            "domain": v["domain"],
+            "search_pattern": v.get("search_pattern", "")
+        }
+        for k, v in SUPPORTED_PLATFORMS.items()
+    ]
+
+
+@router.post("/api/scraper/ecommerce/scrape")
+def trigger_generic_ecommerce_scrape(
+    req: GenericEcommerceScrapeRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    _license_valid: bool = Depends(check_desktop_license)
+):
+    url = (req.url or "").strip()
+    query = (req.query or "").strip()
+    platform = (req.platform or "generic").strip()
+
+    if not url and not query and platform not in SUPPORTED_PLATFORMS:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide a valid e-commerce URL or select a platform and search query."
+        )
+
+    pages = max(1, req.pages or 1)
+    # 20 credits per 10 pages
+    cost = math.ceil(pages / 10.0) * 20
+
+    display_target = url or f"{platform.upper()}: {query}"
+
+    conn = get_db()
+    if current_user["role"] not in ("admin", "superadmin"):
+        if current_user["credits"] < cost:
+            conn.close()
+            raise HTTPException(
+                status_code=403,
+                detail=f"Insufficient credits to run E-Commerce scraper (requires {cost} credits for {pages} pages)."
+            )
+
+        conn.execute("UPDATE users SET credits = credits - ? WHERE id = ?", (cost, current_user["id"]))
+        conn.execute(
+            "INSERT INTO credit_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, 'deduct', ?)",
+            (current_user["id"], cost, f"Universal E-Commerce Scraper ({pages} pages, target: '{display_target[:40]}')")
+        )
+        auth_header = request.headers.get("authorization", "")
+        raw_tok = auth_header.split(" ", 1)[1] if auth_header.startswith("Bearer ") else None
+        sync_credit_deduction_to_cloud(raw_tok, cost, f"Universal E-Commerce Scraper ({pages} pages, target: '{display_target[:40]}')")
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO scrape_jobs (user_id, query, scraper_type, status, cost_credits) VALUES (?, ?, 'ecommerce', 'running', ?)",
+        (current_user["id"], display_target, cost)
+    )
+    conn.commit()
+    job_id = cursor.lastrowid
+    conn.close()
+
+    background_tasks.add_task(
+        run_background_ecommerce_scrape,
+        job_id,
+        url,
+        query,
+        platform,
+        pages,
+        req.max_items,
+        req.headless if req.headless is not None else True
+    )
+    return {"success": True, "job_id": job_id}
+
+
+@router.get("/api/scraper/ecommerce/jobs")
+def get_ecommerce_jobs(current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    if current_user["role"] in ("admin", "superadmin"):
+        jobs = conn.execute(
+            "SELECT sj.*, u.email FROM scrape_jobs sj JOIN users u ON sj.user_id = u.id WHERE sj.scraper_type = 'ecommerce' ORDER BY sj.created_at DESC"
+        ).fetchall()
+    else:
+        jobs = conn.execute(
+            "SELECT * FROM scrape_jobs WHERE user_id = ? AND scraper_type = 'ecommerce' ORDER BY created_at DESC",
+            (current_user["id"],)
+        ).fetchall()
+    conn.close()
+    return [dict(j) for j in jobs]
+
+
 @router.get("/api/scraper/jobs")
 def get_jobs(scraper_type: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     conn = get_db()
@@ -361,15 +456,15 @@ def download_job_excel(job_id: int, request: Request, token: Optional[str] = Non
         raise HTTPException(status_code=403, detail="Permission denied.")
 
     job_dict = dict(job)
-    is_daraz = (job_dict.get("scraper_type") == "daraz") or ("_daraz_" in str(job_dict.get("result_path") or ""))
+    is_ecommerce = (job_dict.get("scraper_type") in ("daraz", "ecommerce", "generic_ecommerce")) or ("_daraz_" in str(job_dict.get("result_path") or "")) or ("_ecommerce_" in str(job_dict.get("result_path") or ""))
     if current_user["role"] not in ("admin", "superadmin"):
         eff_perms = get_user_effective_permissions(conn, current_user)
-        if is_daraz:
+        if is_ecommerce:
             if not eff_perms.get("allow_daraz_download"):
                 conn.close()
                 raise HTTPException(
                     status_code=403,
-                    detail="Downloading raw Daraz Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
+                    detail="Downloading raw E-Commerce Excel spreadsheets is available exclusively for Pro and Enterprise subscribers. You can view all records directly in your Private Catalogue."
                 )
         else:
             if not eff_perms.get("allow_dataset_download"):
@@ -402,7 +497,7 @@ def download_job_excel(job_id: int, request: Request, token: Optional[str] = Non
         raise HTTPException(status_code=404, detail="Result file not found or job incomplete.")
 
     sanitized_query = re.sub(r'[^a-zA-Z0-9_\-]', '_', job["query"] or "data")
-    prefix = "daraz" if is_daraz else "scraped"
+    prefix = "daraz" if (job_dict.get("scraper_type") == "daraz") else ("ecommerce" if is_ecommerce else "scraped")
     filename = f"{prefix}_{sanitized_query}_job{job_id}.xlsx"
     return FileResponse(
         file_path,

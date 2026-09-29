@@ -14,3 +14,11 @@ class DarazScrapeRequest(BaseModel):
     pages: Optional[int] = 1
     max_items: Optional[int] = None
     headless: Optional[bool] = True
+
+class GenericEcommerceScrapeRequest(BaseModel):
+    url: Optional[str] = None
+    query: Optional[str] = None
+    platform: Optional[str] = "generic"
+    pages: Optional[int] = 1
+    max_items: Optional[int] = None
+    headless: Optional[bool] = True
