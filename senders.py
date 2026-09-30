@@ -13,14 +13,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from scraper import find_local_driver
 from datetime import datetime
 from database import get_db
-
-# Log files directory
-LOGS_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(LOGS_FOLDER, exist_ok=True)
-
-# Screenshot directory for live map view
-SCREENSHOTS_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrape_results", "screenshots")
-os.makedirs(SCREENSHOTS_FOLDER, exist_ok=True)
+from core.constants import DATA_DIR, LOGS_FOLDER, SCRAPER_SCREENSHOTS_FOLDER as SCREENSHOTS_FOLDER
 
 def write_log_to_file(campaign_id, campaign_type, message):
     """Write campaign log entry to day-wise log file"""
@@ -137,8 +130,11 @@ def setup_driver(log_cb=None):
         else:
             print(msg)
 
-    profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whatsapp_session")
-    os.makedirs(profile_path, exist_ok=True)
+    profile_path = os.path.join(DATA_DIR, "whatsapp_session")
+    try:
+        os.makedirs(profile_path, exist_ok=True)
+    except Exception:
+        pass
     cleanup_profile_locks(profile_path)
     fix_chrome_preferences(profile_path)
 

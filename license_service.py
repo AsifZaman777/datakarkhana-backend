@@ -6,11 +6,12 @@ import base64
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
+from core.constants import DATA_DIR
 
 # Load secret key from environment or default JWT_SECRET
 LICENSE_SECRET = os.getenv("LICENSE_MASTER_SECRET") or os.getenv("JWT_SECRET") or "marketingostad_super_secret_cyber_key_999"
-LICENSE_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "license.json")
-CACHE_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".license_cache.json")
+LICENSE_FILE_PATH = os.path.join(DATA_DIR, "license.json")
+CACHE_FILE_PATH   = os.path.join(DATA_DIR, ".license_cache.json")
 
 
 def _b64_encode(data: str) -> str:

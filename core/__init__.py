@@ -1,4 +1,6 @@
 from .constants import (
+    BASE_DIR,
+    DATA_DIR,
     UPLOAD_FOLDER,
     SCRAPE_RESULTS_FOLDER,
     SCRAPER_SCREENSHOTS_FOLDER,

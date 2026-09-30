@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 
 from database import get_db
-from core.constants import LOGS_FOLDER
+from core.constants import LOGS_FOLDER, DATA_DIR
 from core.dependencies import get_current_user
 from services.dataset_service import clean_lead_df
 from services.email_service import send_free_verification_email
@@ -32,8 +32,7 @@ router = APIRouter(tags=["Marketing"])
 
 @router.get("/api/marketing/whatsapp-status")
 def whatsapp_status():
-    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    profile = os.path.join(backend_dir, "whatsapp_session")
+    profile = os.path.join(DATA_DIR, "whatsapp_session")
     if not os.path.exists(profile):
         return {"session_active": False}
     
@@ -81,8 +80,7 @@ def whatsapp_reset_session(background_tasks: BackgroundTasks, current_user: dict
     import shutil
     from senders import setup_driver, wait_for_whatsapp_login, set_active_setup_driver, close_active_setup_driver
     close_active_setup_driver()
-    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    profile = os.path.join(backend_dir, "whatsapp_session")
+    profile = os.path.join(DATA_DIR, "whatsapp_session")
     if os.path.exists(profile):
         try:
             shutil.rmtree(profile, ignore_errors=True)
