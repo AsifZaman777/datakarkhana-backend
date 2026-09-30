@@ -57,8 +57,10 @@ def main():
         "--hidden-import", "selenium",
         "--hidden-import", "fastapi",
         "--hidden-import", "pydantic",
+        "--hidden-import", "bs4",
         "--collect-all", "uvicorn",
         "--collect-all", "selenium",
+        "--collect-all", "bs4",
         f'"{BACKEND_DIR / "main.py"}"'
     ]
 
