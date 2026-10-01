@@ -40,6 +40,7 @@ from routers import (
     admin_router,
     config_router,
     models_router,
+    stocks_router,
 )
 
 # Initialize FastAPI application
@@ -120,6 +121,7 @@ app.include_router(marketing_router)
 app.include_router(admin_router)
 app.include_router(config_router)
 app.include_router(models_router)
+app.include_router(stocks_router)
 
 # ── Background keep-alive & Startup ───────────────────────
 
@@ -171,6 +173,25 @@ def startup_event():
         print("[OK] Supabase PostgreSQL connected and ready.")
     except Exception as e:
         print("[STARTUP DB ERROR]", e)
+
+    # Start local DSE Stock Market live background daemon
+    try:
+        from services.dse_service import DSEMarketService
+        dse = DSEMarketService.get_instance()
+        dse.start_background_worker()
+        print("[OK] DSE Stock Market live background ingestion daemon started.")
+    except Exception as ex:
+        print("[DSE WORKER STARTUP NOTICE]", ex)
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    try:
+        from services.dse_service import DSEMarketService
+        dse = DSEMarketService.get_instance()
+        dse.stop_background_worker()
+    except Exception:
+        pass
 
 
 # ── Re-exports for backward compatibility & testing ───────

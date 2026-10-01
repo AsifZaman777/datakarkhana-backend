@@ -218,12 +218,12 @@ def setup_driver(log_cb=None):
 
     raise RuntimeError(f"Unable to initialize Chrome or Edge browser engines for WhatsApp ({err_str})") from chrome_err
 
-def wait_for_whatsapp_login(driver):
+def wait_for_whatsapp_login(driver, timeout: int = 180):
     """Wait for scan session verification and open active WhatsApp chats"""
     if "web.whatsapp.com" not in driver.current_url:
         driver.get("https://web.whatsapp.com")
     start_time = time.time()
-    while time.time() - start_time < 180:
+    while time.time() - start_time < timeout:
         try:
             indicators = driver.find_elements(By.XPATH, '//div[@id="side"] | //div[@data-testid="chat-list"] | //div[@id="pane-side"] | //header')
             if indicators and len(indicators) > 0:
@@ -713,4 +713,93 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
                 driver.quit()
             except Exception:
                 pass
+
+
+def send_single_whatsapp_message(phone: str, message_text: str) -> bool:
+    """Send an immediate single WhatsApp message via local Selenium session for stock alerts."""
+    formatted = format_phone(phone)
+    if not formatted:
+        print(f"[STOCK ALERT SENDER] Invalid phone number: {phone}")
+        return False
+
+    driver = get_active_setup_driver()
+    driver_owned = False
+    if not driver:
+        try:
+            driver = setup_driver(log_cb=print)
+            driver_owned = True
+            if not wait_for_whatsapp_login(driver, timeout=30):
+                print("[STOCK ALERT SENDER] WhatsApp Web not logged in. Please scan QR in desktop app.")
+                if driver_owned:
+                    driver.quit()
+                return False
+        except Exception as e:
+            print(f"[STOCK ALERT SENDER] Error starting driver: {e}")
+            return False
+
+    try:
+        url = f"https://web.whatsapp.com/send?phone={formatted}"
+        try:
+            driver.execute_script("window.location.href = arguments[0];", url)
+        except Exception:
+            driver.get(url)
+
+        start_time = time.time()
+        chat_ready = False
+        textbox = None
+
+        textbox_selectors = [
+            '//footer//div[@contenteditable="true"]',
+            '//footer//div[@role="textbox"]',
+            '//div[@data-tab="10"]',
+            '//div[contains(@aria-placeholder, "Type a message")]',
+            '//footer//p',
+            '//div[@contenteditable="true"]'
+        ]
+
+        while time.time() - start_time < 25:
+            if check_and_dismiss_invalid_modal(driver):
+                print(f"[STOCK ALERT SENDER] Number {formatted} is not registered on WhatsApp.")
+                return False
+
+            try:
+                for sel in textbox_selectors:
+                    inputs = driver.find_elements(By.XPATH, sel)
+                    if inputs and len(inputs) > 0:
+                        textbox = inputs[-1]
+                        chat_ready = True
+                        break
+                if chat_ready:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not chat_ready or not textbox:
+            print("[STOCK ALERT SENDER] Chat textbox load timed out.")
+            return False
+
+        # Type message with newline handling
+        lines = message_text.split("\n")
+        for i, line in enumerate(lines):
+            textbox.send_keys(line)
+            if i < len(lines) - 1:
+                ActionChains(driver).key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
+
+        time.sleep(0.3)
+        textbox.send_keys(Keys.ENTER)
+        time.sleep(1.0)
+        print(f"[STOCK ALERT SENDER] Successfully sent alert to {formatted}")
+        return True
+
+    except Exception as ex:
+        print(f"[STOCK ALERT SENDER] Exception during send: {ex}")
+        return False
+    finally:
+        if driver_owned and driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
 

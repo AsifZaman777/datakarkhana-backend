@@ -13,7 +13,7 @@ from core.security import hash_password
 TABLES_WITH_AUTO_ID = {
     "users", "datasets", "scrape_jobs", "access_logs", "credit_transactions",
     "scrape_logs", "campaign_logs", "dataset_requests", "security_violations",
-    "payment_requests", "brevo_applications", "licenses"
+    "payment_requests", "brevo_applications", "licenses", "stock_ticks_intraday", "stock_news"
 }
 
 _INSERT_TABLE_RE = re.compile(r"^\s*INSERT\s+INTO\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
@@ -24,6 +24,7 @@ CONFLICT_KEYS = {
     "payment_settings": ("setting_key", "setting_value = EXCLUDED.setting_value"),
     "whatsapp_progress": ("recipient_group", "last_index = EXCLUDED.last_index, updated_at = CURRENT_TIMESTAMP"),
     "banned_ips": ("ip_address", None),  # None means DO NOTHING
+    "stock_alert_settings": ("key", "value = EXCLUDED.value"),
 }
 
 def get_local_sqlite_path() -> str:
@@ -932,19 +933,79 @@ def init_db():
     except Exception as e:
         print("[SUPERADMIN SEED NOTICE]", e)
 
+    # 18. Stock Market Live Tables
     try:
-        admin_pwd = hash_password("admin123")
         cursor.execute("""
-            INSERT INTO users (email, full_name, password_hash, role, credits, is_verified, is_banned)
-            VALUES ('admin@databazaar.com', 'Admin Databazaar', %s, 'admin', 9999, 1, 0)
-            ON CONFLICT (email) DO UPDATE SET
-                role = 'admin',
-                credits = 9999,
-                is_verified = 1,
-                is_banned = 0;
-        """, (admin_pwd,))
-    except Exception:
-        pass
+            CREATE TABLE IF NOT EXISTS stock_tickers (
+                ticker TEXT PRIMARY KEY,
+                company_name TEXT NOT NULL,
+                sector TEXT,
+                category TEXT,
+                asset_type TEXT,
+                board TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stock_ticks_intraday (
+                id SERIAL PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                ltp REAL NOT NULL,
+                high REAL,
+                low REAL,
+                open REAL,
+                close_price REAL,
+                ycp REAL,
+                change_val REAL,
+                change_pct REAL,
+                volume BIGINT,
+                value_mn REAL,
+                trade_count INTEGER,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stock_news (
+                id SERIAL PRIMARY KEY,
+                news_id TEXT UNIQUE,
+                ticker TEXT,
+                company_name TEXT,
+                news_type TEXT,
+                published_date TEXT,
+                published_time TEXT,
+                title TEXT NOT NULL,
+                body TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_stock_alerts (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                whatsapp_number TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                alert_type TEXT NOT NULL,
+                threshold_value REAL,
+                is_one_shot INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'ACTIVE',
+                last_triggered_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stock_alert_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
+        try:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_ticks_ticker ON stock_ticks_intraday(ticker, recorded_at);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_stock_alerts_ticker ON user_stock_alerts(ticker, status);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_news_ticker ON stock_news(ticker, published_date);")
+        except Exception:
+            pass
+    except Exception as e:
+        print("[STOCK MARKET TABLES INIT NOTICE]", e)
 
     conn.commit()
     conn.close()

@@ -8,6 +8,7 @@ from routers.marketing import router as marketing_router
 from routers.admin import router as admin_router
 from routers.config import router as config_router
 from routers.models import router as models_router
+from routers.stocks import router as stocks_router
 
 __all__ = [
     "health_router",
@@ -20,5 +21,6 @@ __all__ = [
     "admin_router",
     "config_router",
     "models_router",
+    "stocks_router",
 ]
 
