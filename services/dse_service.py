@@ -116,9 +116,11 @@ class DSEMarketService:
         self._block_market_cache: List[Dict[str, Any]] = []
         self._last_block_market_time: float = 0.0
         self._movers_cache: List[Dict[str, Any]] = []
+        self._movers_dict_cache: Dict[str, Any] = {}
         self._last_movers_time: float = 0.0
         self._top_movers_cache: Dict[str, Any] = {}
         self._last_top_movers_time: float = 0.0
+        self._last_sector_time: float = 0.0
 
         # Signatures & Real-time WS client states
         self._market_sig: str = ""
@@ -220,7 +222,7 @@ class DSEMarketService:
             headers = await self.get_lankabd_headers()
             res = await client.get(f"{LANKABD_BASE_URL}/api/datafeed/IndexLiveData/SectorWiseMarketMapd3", headers=headers)
             
-            if res.status_code == 400:
+            if res.status_code in (400, 401):
                 headers = await self.get_lankabd_headers(force_refresh=True)
                 res = await client.get(f"{LANKABD_BASE_URL}/api/datafeed/IndexLiveData/SectorWiseMarketMapd3", headers=headers)
 
@@ -238,43 +240,69 @@ class DSEMarketService:
             for s in children:
                 s_name = s.get("name", "").strip()
                 stocks = s.get("children", [])
-                total_turnover = sum(float(x.get("turnover") or 0.0) for x in stocks)
-                pcts = []
+                
+                # Use exact real-time fields directly from LankaBangla
+                sec_pct = clean_float(s.get("marketCapitalChangePCT"))
+                sec_turnover = clean_float(s.get("turnover"))
+                sec_volume = clean_int(s.get("volume"))
+                sec_trades = clean_int(s.get("trades"))
+                sec_up = clean_int(s.get("priceUpSymbols"))
+                sec_down = clean_int(s.get("priceDownSymbols"))
+                sec_flat = clean_int(s.get("priceFlatSymbols"))
+                sec_mkt_cap = clean_float(s.get("marketCapital"))
+
+                adv_count += sec_up
+                dec_count += sec_down
+                unch_count += sec_flat
+
                 for x in stocks:
                     sym = str(x.get("symbol") or "").strip()
                     if sym:
                         self._ticker_sector_map[sym] = s_name
 
-                    ch = float(x.get("pricechange") or 0.0)
-                    if ch > 0:
-                        adv_count += 1
-                    elif ch < 0:
-                        dec_count += 1
-                    else:
-                        unch_count += 1
-
-                    try:
-                        pcts.append(float(x.get("pricechangepct") or 0.0))
-                    except (ValueError, TypeError):
-                        pass
-
-                avg_pct = round(sum(pcts) / len(pcts), 2) if pcts else 0.0
-
-                if avg_pct > 0:
-                    alpha = min(0.9, max(0.4, 0.4 + (avg_pct / 5.0) * 0.5))
-                    bg_color = f"rgba(29, 122, 63, {alpha:.2f})"
-                elif avg_pct < 0:
-                    alpha = min(0.9, max(0.4, 0.4 + (abs(avg_pct) / 5.0) * 0.5))
-                    bg_color = f"rgba(192, 57, 43, {alpha:.2f})"
+                # Exact color assignment matching LankaBangla rules:
+                # pct >= 3.0: sector-gt3
+                # pct >= 0.5: sector-gt-pt5
+                # pct > 0.0: sector-gt-0
+                # pct <= -3.0: sector-lt-3
+                # pct <= -0.5: sector-lt-pt5
+                # pct < 0.0: sector-lt-0
+                # else: sector-default
+                if sec_pct >= 3.0:
+                    bg_color = "linear-gradient(135deg, rgba(23, 199, 38, 0.9) 0%, rgba(15, 170, 30, 0.95) 100%)"
+                    color_class = "sector-gt3"
+                elif sec_pct >= 0.5:
+                    bg_color = "linear-gradient(135deg, rgba(40, 121, 61, 0.88) 0%, rgba(28, 101, 44, 0.95) 100%)"
+                    color_class = "sector-gt-pt5"
+                elif sec_pct > 0.0:
+                    bg_color = "linear-gradient(135deg, rgba(35, 86, 48, 0.85) 0%, rgba(26, 64, 35, 0.92) 100%)"
+                    color_class = "sector-gt-0"
+                elif sec_pct <= -3.0:
+                    bg_color = "linear-gradient(135deg, rgba(224, 2, 24, 0.9) 0%, rgba(255, 0, 26, 0.95) 100%)"
+                    color_class = "sector-lt-3"
+                elif sec_pct <= -0.5:
+                    bg_color = "linear-gradient(135deg, rgba(169, 4, 28, 0.88) 0%, rgba(144, 1, 12, 0.95) 100%)"
+                    color_class = "sector-lt-pt5"
+                elif sec_pct < 0.0:
+                    bg_color = "linear-gradient(135deg, rgba(142, 4, 18, 0.85) 0%, rgba(136, 16, 28, 0.92) 100%)"
+                    color_class = "sector-lt-0"
                 else:
-                    bg_color = "rgba(100, 116, 139, 0.5)"
+                    bg_color = "linear-gradient(135deg, rgba(55, 65, 81, 0.7) 0%, rgba(31, 41, 55, 0.8) 100%)"
+                    color_class = "sector-default"
 
                 sectors_list.append({
                     "code": s_name,
                     "name": s_name,
-                    "change_pct": avg_pct,
-                    "turnover": round(total_turnover, 2),
+                    "change_pct": round(sec_pct, 2),
+                    "turnover": round(sec_turnover, 2),
+                    "volume": sec_volume,
+                    "trades": sec_trades,
+                    "price_up": sec_up,
+                    "price_down": sec_down,
+                    "price_flat": sec_flat,
+                    "market_cap": sec_mkt_cap,
                     "bg_color": bg_color,
+                    "color_class": color_class,
                     "stocks_count": len(stocks)
                 })
 
@@ -289,12 +317,18 @@ class DSEMarketService:
                 "adv": adv_count,
                 "dec": dec_count,
                 "unch": unch_count,
+                "total_sectors": len(sectors_list),
                 "sectors": sorted_sectors,
                 "top_12": top_12,
+                "mkt_total_market_cap": clean_float(data.get("mktTotalMarketCap")),
+                "mkt_total_turnover": clean_float(data.get("marketTotalTurnover")),
+                "mkt_total_volume": clean_int(data.get("marketTotalVolume")),
+                "mkt_total_trades": clean_int(data.get("marketTotalTrades")),
                 "last_scraped_at": datetime.now(BST).isoformat(),
                 "source": "LankaBangla Portal"
             }
             self._sector_heatmap_cache = result
+            self._last_sector_time = time.time()
             return result
         except Exception as e:
             logger.error(f"[LankaBD] Error fetching sector heatmap: {e}")
@@ -809,47 +843,79 @@ class DSEMarketService:
             logger.error(f"[LankaBD Block Market Error] {e}")
         return self._block_market_cache
 
-    async def fetch_index_movers(self, count: int = 15) -> List[Dict[str, Any]]:
-        """Fetch index movers and contribution points from LankaBangla"""
+    async def fetch_index_movers(self, count: int = 10) -> Dict[str, Any]:
+        """Fetch index movers (pullers and draggers) and contribution points from LankaBangla"""
         now = time.time()
-        if self._movers_cache and (now - self._last_movers_time) < 15.0:
-            return self._movers_cache
+        if self._movers_dict_cache and (now - self._last_movers_time) < 10.0:
+            return self._movers_dict_cache
 
         try:
             client = await self.get_client()
             headers = await self.get_lankabd_headers()
-            res = await client.get(f"{LANKABD_BASE_URL}/api/APIMarket/GetIndexMover?count={count}", headers=headers)
-            if res.status_code == 400:
-                headers = await self.get_lankabd_headers(force_refresh=True)
-                res = await client.get(f"{LANKABD_BASE_URL}/api/APIMarket/GetIndexMover?count={count}", headers=headers)
 
-            if res.status_code == 200:
-                raw = res.json()
-                parsed = []
-                for it in raw:
-                    parsed.append({
-                        "symbol": it.get("symbol"),
-                        "company_name": it.get("companyName"),
-                        "ltp": clean_float(it.get("ltp")),
-                        "ycp": clean_float(it.get("ycp")),
-                        "change_percent": clean_float(it.get("changePercent")),
-                        "total_volume": clean_int(it.get("totalVolume")),
-                        "total_value_mn": clean_float(it.get("totalValue")),
-                        "index_mover_points": clean_float(it.get("index_Mover")),
-                        "market_cap": clean_float(it.get("marketCap_T")),
-                        "updated_at": it.get("idxDate"),
-                    })
-                self._movers_cache = parsed
-                self._last_movers_time = now
-                return parsed
+            async def _fetch_movers_by_dir(is_pos: int) -> List[Dict[str, Any]]:
+                try:
+                    r = await client.get(f"{LANKABD_BASE_URL}/api/APIMarket/GetIndexMover?count={count}&isPositive={is_pos}", headers=headers)
+                    if r.status_code in (400, 401):
+                        new_h = await self.get_lankabd_headers(force_refresh=True)
+                        r = await client.get(f"{LANKABD_BASE_URL}/api/APIMarket/GetIndexMover?count={count}&isPositive={is_pos}", headers=new_h)
+                    if r.status_code == 200:
+                        raw = r.json()
+                        parsed = []
+                        for it in raw[:count]:
+                            parsed.append({
+                                "symbol": it.get("symbol"),
+                                "ticker": it.get("symbol"),
+                                "company_name": it.get("companyName"),
+                                "name": it.get("companyName"),
+                                "ltp": clean_float(it.get("ltp")),
+                                "cp": clean_float(it.get("cp")),
+                                "ycp": clean_float(it.get("ycp")),
+                                "change_percent": clean_float(it.get("changePercent")),
+                                "percent": clean_float(it.get("changePercent")),
+                                "total_volume": clean_int(it.get("totalVolume")),
+                                "total_value_mn": clean_float(it.get("totalValue")),
+                                "value_mn": clean_float(it.get("totalValue")),
+                                "index_mover_points": clean_float(it.get("index_Mover")),
+                                "market_cap": clean_float(it.get("marketCap_T")),
+                                "updated_at": it.get("idxDate"),
+                            })
+                        return parsed
+                except Exception as ex:
+                    logger.debug(f"[Index Movers error isPositive={is_pos}] {ex}")
+                return []
+
+            pos_movers, neg_movers = await asyncio.gather(
+                _fetch_movers_by_dir(1),
+                _fetch_movers_by_dir(0),
+                return_exceptions=True
+            )
+            if isinstance(pos_movers, Exception):
+                pos_movers = []
+            if isinstance(neg_movers, Exception):
+                neg_movers = []
+
+            combined = list(pos_movers) + list(neg_movers)
+            res_dict = {
+                "all": combined,
+                "pullers": pos_movers,
+                "draggers": neg_movers,
+                "positive": pos_movers,
+                "negative": neg_movers,
+                "updated_at": datetime.now(BST).isoformat()
+            }
+            self._movers_cache = combined
+            self._movers_dict_cache = res_dict
+            self._last_movers_time = now
+            return res_dict
         except Exception as e:
             logger.error(f"[LankaBD Movers Error] {e}")
-        return self._movers_cache
+            return self._movers_dict_cache or {"all": self._movers_cache, "positive": self._movers_cache, "negative": []}
 
     async def fetch_top_movers(self) -> Dict[str, Any]:
         """Fetch top gainers, losers, turnover, and volume leaders from LankaBangla"""
         now = time.time()
-        if self._top_movers_cache and (now - self._last_top_movers_time) < 15.0:
+        if self._top_movers_cache and (now - self._last_top_movers_time) < 10.0:
             return self._top_movers_cache
 
         try:
@@ -859,22 +925,35 @@ class DSEMarketService:
             async def _fetch_list(endpoint: str) -> List[Dict[str, Any]]:
                 try:
                     r = await client.get(f"{LANKABD_BASE_URL}{endpoint}", headers=headers)
+                    if r.status_code in (400, 401):
+                        new_headers = await self.get_lankabd_headers(force_refresh=True)
+                        r = await client.get(f"{LANKABD_BASE_URL}{endpoint}", headers=new_headers)
                     if r.status_code == 200:
                         items = r.json()
                         res = []
                         for it in items[:10]:
                             code = str(it.get("mkistaT_INSTRUMENT_CODE") or it.get("symbol") or "").strip()
+                            if not code:
+                                continue
                             ltp = clean_float(it.get("lastTradedPrice") or it.get("mkistaT_PUB_LAST_TRADED_PRICE"))
-                            chg = clean_float(it.get("priceChange"))
-                            pct = clean_float(it.get("priceChangePCT"))
+                            chg = clean_float(it.get("priceChange") or it.get("priceChange_DSE"))
+                            pct = clean_float(it.get("priceChangePCT_DSE") or it.get("priceChangePCT"))
                             vol = clean_int(it.get("mkistaT_TOTAL_VOLUME"))
                             val_mn = clean_float(it.get("mkistaT_TOTAL_VALUE"))
-                            trades = clean_int(it.get("mkistaT_TOTAL_TRADES"))
+                            trades = clean_int(it.get("mkistaT_TOTAL_TRADES") or it.get("trades"))
                             name = str(it.get("companyName") or code).strip()
+                            cid = clean_int(it.get("companyID"))
+                            close_p = clean_float(it.get("mkistaT_CLOSE_PRICE") or it.get("mkistaT_YDAY_CLOSE_PRICE"))
+                            ycp = clean_float(it.get("mkistaT_YDAY_CLOSE_PRICE"))
                             res.append({
                                 "ticker": code,
+                                "symbol": code,
                                 "name": name,
+                                "company_name": name,
+                                "company_id": cid,
                                 "ltp": ltp,
+                                "close": close_p,
+                                "ycp": ycp,
                                 "change": chg,
                                 "percent": pct,
                                 "volume": vol,
@@ -909,6 +988,8 @@ class DSEMarketService:
                 "top_losers": losers,
                 "top_turnover": turnovers,
                 "top_volume": volumes,
+                "index_movers_pos": self._movers_dict_cache.get("positive", []),
+                "index_movers_neg": self._movers_dict_cache.get("negative", []),
                 "updated_at": datetime.now(BST).isoformat()
             }
             self._last_top_movers_time = now
@@ -1648,7 +1729,9 @@ class DSEMarketService:
                         await self._broadcast({
                             "event": "movers_update",
                             "timestamp": datetime.now(BST).isoformat(),
-                            "movers": mov,
+                            "movers": mov.get("all", []) if isinstance(mov, dict) else mov,
+                            "index_movers_pos": mov.get("positive", []) if isinstance(mov, dict) else [],
+                            "index_movers_neg": mov.get("negative", []) if isinstance(mov, dict) else [],
                             "top_lists": top
                         })
                     asyncio.create_task(_refresh_all_intel())

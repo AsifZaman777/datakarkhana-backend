@@ -85,11 +85,21 @@ def force_stop_campaign(campaign_id: str):
         except Exception:
             pass
 
+def _safe_print(msg: str):
+    try:
+        print(msg)
+    except Exception:
+        try:
+            print(str(msg).encode("ascii", "replace").decode("ascii"))
+        except Exception:
+            pass
+
 def cleanup_profile_locks(profile_path):
     """Remove Chrome Singleton locks that cause Chrome to drop persistent profile sessions"""
     lock_files = [
-        "SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort", "LOCK",
+        "SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort", "LOCK", "lockfile",
         os.path.join("Default", "LOCK"),
+        os.path.join("Default", "lockfile"),
         os.path.join("Default", "WebStorage", "QuotaManager-journal")
     ]
     for lock in lock_files:
@@ -127,9 +137,9 @@ def setup_driver(log_cb=None, headless: bool = False):
             try:
                 log_cb(msg)
             except Exception:
-                pass
+                _safe_print(msg)
         else:
-            print(msg)
+            _safe_print(msg)
 
     profile_path = os.path.join(DATA_DIR, "whatsapp_session")
     try:
@@ -151,6 +161,7 @@ def setup_driver(log_cb=None, headless: bool = False):
             options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--remote-debugging-port=0")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option("useAutomationExtension", False)
@@ -726,10 +737,12 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
 
 _headless_stock_driver = None
 _headless_stock_lock = threading.Lock()
+_last_failed_stock_login_time = 0.0
 
 def get_or_create_headless_stock_driver():
     """Retrieve or spawn a persistent headless Chrome instance dedicated to stock alerts and self-chat bot"""
-    global _headless_stock_driver
+    global _headless_stock_driver, _last_failed_stock_login_time
+    now = time.time()
     if _headless_stock_driver is not None:
         try:
             _ = _headless_stock_driver.title
@@ -741,44 +754,40 @@ def get_or_create_headless_stock_driver():
                 pass
             _headless_stock_driver = None
 
+    # Cooldown to avoid launching Chrome constantly if session is unauthenticated
+    if now - _last_failed_stock_login_time < 60.0:
+        return None
+
     try:
-        drv = setup_driver(log_cb=print, headless=True)
-        if wait_for_whatsapp_login(drv, timeout=30):
+        drv = setup_driver(log_cb=_safe_print, headless=True)
+        if wait_for_whatsapp_login(drv, timeout=5):
             _headless_stock_driver = drv
             return _headless_stock_driver
         else:
-            print("[STOCK ALERT SENDER] WhatsApp session not logged in. Scan QR code in settings to link.")
+            _last_failed_stock_login_time = now
+            _safe_print("[STOCK ALERT SENDER] WhatsApp session not logged in. Alerts queued in headless mode.")
             try:
                 drv.quit()
             except Exception:
                 pass
             return None
     except Exception as e:
-        print(f"[STOCK ALERT SENDER] Error creating headless WhatsApp session: {e}")
+        _last_failed_stock_login_time = now
+        _safe_print(f"[STOCK ALERT SENDER] Error creating headless WhatsApp session: {e}")
         return None
 
 def send_single_whatsapp_message(phone: str, message_text: str, headless: bool = True) -> bool:
     """Send an immediate single WhatsApp message via headless local Selenium session for stock alerts."""
     formatted = format_phone(phone)
     if not formatted:
-        print(f"[STOCK ALERT SENDER] Invalid phone number: {phone}")
+        _safe_print(f"[STOCK ALERT SENDER] Invalid phone number: {phone}")
         return False
 
     with _headless_stock_lock:
         driver = get_or_create_headless_stock_driver() if headless else get_active_setup_driver()
-        driver_owned = False
         if not driver:
-            try:
-                driver = setup_driver(log_cb=print, headless=headless)
-                driver_owned = True
-                if not wait_for_whatsapp_login(driver, timeout=30):
-                    print("[STOCK ALERT SENDER] WhatsApp Web not logged in. Please scan QR in desktop app.")
-                    if driver_owned:
-                        driver.quit()
-                    return False
-            except Exception as e:
-                print(f"[STOCK ALERT SENDER] Error starting driver: {e}")
-                return False
+            _safe_print(f"[STOCK ALERT SENDER] Headless WhatsApp session not ready. Message logged for {formatted}.")
+            return False
 
     try:
         url = f"https://web.whatsapp.com/send?phone={formatted}"

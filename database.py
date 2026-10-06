@@ -25,6 +25,7 @@ CONFLICT_KEYS = {
     "whatsapp_progress": ("recipient_group", "last_index = EXCLUDED.last_index, updated_at = CURRENT_TIMESTAMP"),
     "banned_ips": ("ip_address", None),  # None means DO NOTHING
     "stock_alert_settings": ("key", "value = EXCLUDED.value"),
+    "user_green_api_configs": ("phone_number", "instance_id = EXCLUDED.instance_id, api_token = EXCLUDED.api_token, api_url = EXCLUDED.api_url, is_authorized = EXCLUDED.is_authorized, updated_at = CURRENT_TIMESTAMP"),
 }
 
 def get_local_sqlite_path() -> str:
@@ -1002,6 +1003,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS verified_phone_numbers (
                 phone_number TEXT PRIMARY KEY,
                 verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -1011,9 +1013,29 @@ def init_db():
                 otp_code TEXT NOT NULL,
                 expires_at REAL NOT NULL,
                 attempts INTEGER DEFAULT 0,
+                failed_count INTEGER DEFAULT 0,
+                blocked_until REAL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_green_api_configs (
+                phone_number TEXT PRIMARY KEY,
+                user_id INTEGER,
+                instance_id TEXT NOT NULL,
+                api_token TEXT NOT NULL,
+                api_url TEXT NOT NULL DEFAULT 'https://api.green-api.com',
+                is_authorized INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        try:
+            cursor.execute("ALTER TABLE verified_phone_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;")
+            cursor.execute("ALTER TABLE phone_verification_otps ADD COLUMN IF NOT EXISTS failed_count INTEGER DEFAULT 0;")
+            cursor.execute("ALTER TABLE phone_verification_otps ADD COLUMN IF NOT EXISTS blocked_until REAL DEFAULT 0;")
+        except Exception:
+            pass
         try:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_ticks_ticker ON stock_ticks_intraday(ticker, recorded_at);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_stock_alerts_ticker ON user_stock_alerts(ticker, status);")

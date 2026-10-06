@@ -40,59 +40,200 @@ class StockAlertService:
         return digits
 
     def is_phone_verified(self, phone: str) -> bool:
-        """Check whether this phone number has completed WhatsApp OTP verification"""
+        """Check whether this phone number has an active verified session (valid for 1 week)"""
         norm = self.normalize_phone(phone)
         if not norm:
             return False
         try:
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute("SELECT phone_number FROM verified_phone_numbers WHERE phone_number = %s;", (norm,))
+            cursor.execute("""
+                SELECT phone_number 
+                FROM verified_phone_numbers 
+                WHERE phone_number = %s 
+                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP);
+            """, (norm,))
             row = cursor.fetchone()
             conn.close()
             return row is not None
         except Exception as e:
             logger.error(f"[is_phone_verified error] {e}")
+    def dispose_phone_session(self, phone: str, clear_credentials: bool = False) -> bool:
+        """Dispose of the verified session, clearing verification records and rate limit blocks"""
+        norm = self.normalize_phone(phone)
+        if not norm:
+            return False
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM verified_phone_numbers WHERE phone_number = %s;", (norm,))
+            cursor.execute("DELETE FROM phone_verification_otps WHERE phone_number = %s;", (norm,))
+            if clear_credentials:
+                cursor.execute("DELETE FROM user_green_api_configs WHERE phone_number = %s;", (norm,))
+            conn.commit()
+            conn.close()
+            logger.info(f"[SESSION DISPOSED] WhatsApp session disposed for {norm}")
+            return True
+        except Exception as e:
+            logger.error(f"[dispose_phone_session error] {e}")
             return False
 
+    def get_phone_verification_info(self, phone: str) -> Dict[str, Any]:
+        """Get detailed verification and rate-limit status for a phone number (1-week session)"""
+        norm = self.normalize_phone(phone)
+        if not norm:
+            return {"is_verified": False, "phone": phone}
+
+        now = time.time()
+        info = {
+            "phone": norm,
+            "is_verified": False,
+            "expires_at": None,
+            "remaining_seconds": 0,
+            "is_rate_limited": False,
+            "rate_limited_until": 0,
+            "failed_attempts": 0
+        }
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            # 1. Check verified_phone_numbers
+            cursor.execute("""
+                SELECT phone_number, verified_at, expires_at 
+                FROM verified_phone_numbers 
+                WHERE phone_number = %s;
+            """, (norm,))
+            vrow = cursor.fetchone()
+            if vrow:
+                exp = vrow[2] if isinstance(vrow, (list, tuple)) else vrow.get("expires_at")
+                if exp:
+                    if isinstance(exp, str):
+                        try:
+                            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                        except Exception:
+                            exp_dt = None
+                    elif isinstance(exp, datetime):
+                        exp_dt = exp
+                    else:
+                        exp_dt = None
+
+                    if exp_dt:
+                        if exp_dt.tzinfo is None:
+                            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                        now_utc = datetime.now(timezone.utc)
+                        if exp_dt > now_utc:
+                            info["is_verified"] = True
+                            info["expires_at"] = exp_dt.astimezone(BST).strftime("%Y-%m-%d %I:%M %p BST")
+                            info["remaining_seconds"] = int((exp_dt - now_utc).total_seconds())
+                    else:
+                        info["is_verified"] = True
+                else:
+                    info["is_verified"] = True
+
+            # 2. Check rate limit in phone_verification_otps
+            cursor.execute("""
+                SELECT failed_count, blocked_until 
+                FROM phone_verification_otps 
+                WHERE phone_number = %s;
+            """, (norm,))
+            orow = cursor.fetchone()
+            if orow:
+                fc = int(orow[0] or 0)
+                bu = float(orow[1] or 0.0)
+                info["failed_attempts"] = fc
+                if bu > now:
+                    info["is_rate_limited"] = True
+                    info["rate_limited_until"] = bu
+                    info["rate_limit_remaining_seconds"] = int(bu - now)
+
+            conn.close()
+        except Exception as e:
+            logger.error(f"[get_phone_verification_info error] {e}")
+
+        return info
+
     async def send_verification_otp(self, phone: str) -> Dict[str, Any]:
-        """Generate a 6-digit OTP, store in database, and dispatch via headless WhatsApp self-chat"""
+        """Generate a 6-digit OTP, store in database, apply 7-failed/1-day rate limit, and dispatch to WhatsApp"""
         norm = self.normalize_phone(phone)
         if not norm or len(norm) < 11:
             return {"success": False, "message": "Please enter a valid WhatsApp phone number (e.g. 017xxxxxxxx)."}
 
-        otp_code = f"{random.randint(100000, 999999)}"
-        expires_at = time.time() + 600.0  # 10 minutes
-
+        now = time.time()
         try:
             conn = get_db()
             cursor = conn.cursor()
-            # Upsert into phone_verification_otps
+
+            # Rate Limit check
             cursor.execute("""
-                INSERT INTO phone_verification_otps (phone_number, otp_code, expires_at, attempts)
-                VALUES (%s, %s, %s, 0)
+                SELECT failed_count, blocked_until 
+                FROM phone_verification_otps 
+                WHERE phone_number = %s;
+            """, (norm,))
+            row = cursor.fetchone()
+            failed_count = int(row[0] or 0) if row else 0
+            blocked_until = float(row[1] or 0.0) if row else 0.0
+
+            # If currently blocked (1-day rate limit active)
+            if blocked_until > now:
+                diff_sec = int(blocked_until - now)
+                hours = max(1, (diff_sec + 3599) // 3600)
+                conn.close()
+                return {
+                    "success": False,
+                    "message": f"Too many failed attempts. This phone number is rate-limited for 24 hours to prevent spam. Please try again after {hours} hour(s).",
+                    "is_rate_limited": True,
+                    "retry_after_seconds": diff_sec
+                }
+
+            # If failed_count reached 7, activate 24-hour block
+            if failed_count >= 7:
+                blocked_until = now + 86400.0  # 24 hours (1 day)
+                cursor.execute("""
+                    UPDATE phone_verification_otps 
+                    SET blocked_until = %s 
+                    WHERE phone_number = %s;
+                """, (blocked_until, norm))
+                conn.commit()
+                conn.close()
+                return {
+                    "success": False,
+                    "message": "Too many failed attempts (7/7). This phone number is now rate-limited for 24 hours to prevent spam.",
+                    "is_rate_limited": True,
+                    "retry_after_seconds": 86400
+                }
+
+            otp_code = f"{random.randint(100000, 999999)}"
+            expires_at = now + 600.0  # 10 minutes
+
+            # Upsert into phone_verification_otps preserving failed_count
+            cursor.execute("""
+                INSERT INTO phone_verification_otps (phone_number, otp_code, expires_at, attempts, failed_count, blocked_until)
+                VALUES (%s, %s, %s, 0, %s, %s)
                 ON CONFLICT (phone_number) DO UPDATE
-                SET otp_code = EXCLUDED.otp_code, expires_at = EXCLUDED.expires_at, attempts = 0, created_at = CURRENT_TIMESTAMP;
-            """, (norm, otp_code, expires_at))
+                SET otp_code = EXCLUDED.otp_code, 
+                    expires_at = EXCLUDED.expires_at, 
+                    attempts = 0, 
+                    created_at = CURRENT_TIMESTAMP;
+            """, (norm, otp_code, expires_at, failed_count, blocked_until))
             conn.commit()
             conn.close()
         except Exception as e:
             logger.error(f"[send_verification_otp db error] {e}")
             return {"success": False, "message": f"Database error storing OTP: {e}"}
 
-        # Format message in conversational AI bot style for Self-Chat
+        # Format message for WhatsApp inbox delivery
         otp_message = (
             "🤖 *[DataKarkhana AI Stock Bot]*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔐 *WhatsApp Self-Chat Verification*\n\n"
+            "🔐 *WhatsApp Phone Verification*\n\n"
             f"Your one-time security OTP code is:\n"
             f"👉  *{otp_code}*  👈\n\n"
             "Enter this 6-digit code in DataKarkhana to verify this phone number.\n"
-            "Once verified, your personal WhatsApp Self-Chat will be linked to receive:\n"
+            "Once verified, your WhatsApp session will remain active for 1 full week (7 days) to receive:\n"
             "• Real-time stock target price alerts\n"
             "• Circuit breaker & intra-day spike notifications\n"
             "• Corporate announcements (PSI), earnings & dividends\n"
-            "• Conversational bot replies right inside your self-chat!\n\n"
+            "• Interactive live quotes & bot commands right in your chat!\n\n"
             "⏱️ *Code expires in 10 minutes.*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "⚡ DataKarkhana Live Trading Intelligence"
@@ -103,61 +244,129 @@ class StockAlertService:
         return {
             "success": True,
             "message": f"Verification code dispatched to {norm} via WhatsApp.",
-            "phone": norm
+            "phone": norm,
+            "failed_attempts": failed_count,
+            "max_attempts": 7
         }
 
     async def verify_phone_otp(self, phone: str, otp: str) -> Dict[str, Any]:
-        """Verify the user-provided OTP code against the database record"""
+        """Verify the user-provided OTP code against the database record and grant 1-week session"""
         norm = self.normalize_phone(phone)
         input_code = str(otp).strip()
 
         if not norm or not input_code:
             return {"success": False, "message": "Phone number and OTP code are required."}
 
+        now = time.time()
         try:
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute("SELECT otp_code, expires_at, attempts FROM phone_verification_otps WHERE phone_number = %s;", (norm,))
+            cursor.execute("""
+                SELECT otp_code, expires_at, attempts, failed_count, blocked_until 
+                FROM phone_verification_otps 
+                WHERE phone_number = %s;
+            """, (norm,))
             row = cursor.fetchone()
 
             if not row:
                 conn.close()
                 return {"success": False, "message": "No verification request found for this phone number. Please request a new OTP."}
 
-            stored_code = row[0] if isinstance(row, (list, tuple)) else row["otp_code"]
+            stored_code = str(row[0] if isinstance(row, (list, tuple)) else row["otp_code"])
             expires_at = float(row[1] if isinstance(row, (list, tuple)) else row["expires_at"])
             attempts = int(row[2] if isinstance(row, (list, tuple)) else row["attempts"])
+            failed_count = int(row[3] if isinstance(row, (list, tuple)) else (row.get("failed_count") or 0))
+            blocked_until = float(row[4] if isinstance(row, (list, tuple)) else (row.get("blocked_until") or 0.0))
 
-            if time.time() > expires_at:
+            # 1. Check if number is blocked for 1 day
+            if blocked_until > now:
+                diff_sec = int(blocked_until - now)
+                hours = max(1, (diff_sec + 3599) // 3600)
                 conn.close()
-                return {"success": False, "message": "This verification code has expired. Please request a new OTP."}
+                return {
+                    "success": False,
+                    "message": f"Too many failed attempts. This phone number is rate-limited for 24 hours to prevent spam. Please try again after {hours} hour(s).",
+                    "is_rate_limited": True,
+                    "retry_after_seconds": diff_sec
+                }
 
-            if attempts >= 5:
-                conn.close()
-                return {"success": False, "message": "Too many failed attempts. Please request a new OTP."}
-
-            if stored_code != input_code:
-                cursor.execute("UPDATE phone_verification_otps SET attempts = attempts + 1 WHERE phone_number = %s;", (norm,))
+            # 2. Check if OTP is expired
+            if now > expires_at:
+                new_failed = failed_count + 1
+                new_blocked = (now + 86400.0) if new_failed >= 7 else 0.0
+                cursor.execute("""
+                    UPDATE phone_verification_otps 
+                    SET failed_count = %s, blocked_until = %s 
+                    WHERE phone_number = %s;
+                """, (new_failed, new_blocked, norm))
                 conn.commit()
                 conn.close()
-                return {"success": False, "message": "Incorrect verification code. Please check and try again."}
+                if new_failed >= 7:
+                    return {
+                        "success": False,
+                        "message": "This verification code has expired and maximum failed attempts (7/7) reached. This number is rate-limited for 24 hours.",
+                        "is_rate_limited": True,
+                        "failed_attempts": 7,
+                        "max_attempts": 7
+                    }
+                return {
+                    "success": False,
+                    "message": f"This verification code has expired. (Failed attempt {new_failed} of 7). Please request a new OTP.",
+                    "failed_attempts": new_failed,
+                    "max_attempts": 7
+                }
 
-            # Verification successful: record verified number and clean up OTP
+            # 3. Check if OTP does not match
+            if stored_code != input_code:
+                new_failed = failed_count + 1
+                new_blocked = (now + 86400.0) if new_failed >= 7 else 0.0
+                cursor.execute("""
+                    UPDATE phone_verification_otps 
+                    SET attempts = attempts + 1, failed_count = %s, blocked_until = %s 
+                    WHERE phone_number = %s;
+                """, (new_failed, new_blocked, norm))
+                conn.commit()
+                conn.close()
+                if new_failed >= 7:
+                    return {
+                        "success": False,
+                        "message": "Incorrect verification code. Maximum failed attempts (7/7) reached! This phone number is now rate-limited for 24 hours to prevent spam.",
+                        "is_rate_limited": True,
+                        "failed_attempts": 7,
+                        "max_attempts": 7
+                    }
+                return {
+                    "success": False,
+                    "message": f"Incorrect verification code. (Attempt {new_failed} of 7). Please check and try again.",
+                    "failed_attempts": new_failed,
+                    "max_attempts": 7
+                }
+
+            # 4. OTP MATCHED! Verification successful!
+            # Clean up OTP record
             cursor.execute("DELETE FROM phone_verification_otps WHERE phone_number = %s;", (norm,))
+
+            # 1-week session expiry (7 days from now)
+            expires_at_dt = datetime.now(timezone.utc) + timedelta(days=7)
             cursor.execute("""
-                INSERT INTO verified_phone_numbers (phone_number, verified_at)
-                VALUES (%s, CURRENT_TIMESTAMP)
-                ON CONFLICT (phone_number) DO UPDATE SET verified_at = CURRENT_TIMESTAMP;
-            """, (norm,))
+                INSERT INTO verified_phone_numbers (phone_number, verified_at, expires_at)
+                VALUES (%s, CURRENT_TIMESTAMP, %s)
+                ON CONFLICT (phone_number) DO UPDATE 
+                SET verified_at = CURRENT_TIMESTAMP,
+                    expires_at = EXCLUDED.expires_at;
+            """, (norm, expires_at_dt))
             conn.commit()
             conn.close()
 
-            # Send interactive welcome bot message into the self-chat
+            week_expiry_str = (datetime.now(BST) + timedelta(days=7)).strftime("%Y-%m-%d %I:%M %p BST")
+
+            # Send interactive welcome bot message directly into the inbox
             welcome_msg = (
                 "🤖 *[DataKarkhana AI Stock Bot Activated!]*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "✅ *WhatsApp Self-Chat Verified Successfully!*\n\n"
-                "This self-chat is now your personal AI Stock Trading Assistant.\n"
+                "✅ *WhatsApp Inbox Verified Successfully!*\n\n"
+                "This chat is now your personal AI Stock Trading Assistant.\n"
+                f"⏱️ *Session Status:* Active for 1 week (until {week_expiry_str}).\n"
                 "All your price targets, sudden spikes, circuit breakers, and company filings will arrive right here.\n\n"
                 "💡 *Try sending these bot commands in this chat:* \n"
                 "• *GP* → Instant live quote for Grameenphone\n"
@@ -172,8 +381,10 @@ class StockAlertService:
 
             return {
                 "success": True,
-                "message": "Phone number verified successfully! Self-chat alerts are now enabled.",
-                "phone": norm
+                "message": f"Phone number verified successfully! WhatsApp session is active for 1 week (until {week_expiry_str}).",
+                "phone": norm,
+                "session_valid_until": week_expiry_str,
+                "session_valid_days": 7
             }
 
         except Exception as e:
@@ -378,17 +589,39 @@ class StockAlertService:
             logger.error(f"Error updating alert triggered state: {e}")
 
     async def _dispatch_whatsapp(self, phone: str, message_text: str):
-        """Run headless Selenium WhatsApp sender in threadpool to prevent blocking the async loop"""
+        """Dispatch WhatsApp message using Green-API (primary) or local headless Selenium (fallback)"""
+        norm_phone = self.normalize_phone(phone)
+        if not norm_phone:
+            logger.warning(f"[WHATSAPP ALERT] Invalid phone: {phone}")
+            return False
+
+        # 1. Attempt Green-API cloud gateway dispatch (user-specific or global)
+        try:
+            from services.green_api_service import GreenApiService
+            green_api = GreenApiService.get_instance()
+            res = await green_api.send_message(norm_phone, message_text)
+            if res.get("success"):
+                logger.info(f"[WHATSAPP ALERT VIA GREEN-API SUCCESS] Dispatched to {norm_phone}")
+                return True
+            else:
+                logger.warning(f"[WHATSAPP ALERT GREEN-API FAILED] {res.get('message')}. Attempting Selenium fallback...")
+        except Exception as e:
+            logger.error(f"[WHATSAPP ALERT GREEN-API EXCEPTION] {e}")
+
+        # 2. Local headless Selenium session fallback
         try:
             from senders import send_single_whatsapp_message
             loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(None, send_single_whatsapp_message, phone, message_text, True)
+            success = await loop.run_in_executor(None, send_single_whatsapp_message, norm_phone, message_text, True)
             if success:
-                logger.info(f"[WHATSAPP ALERT SUCCESS] Dispatched to {phone} (Headless)")
+                logger.info(f"[WHATSAPP ALERT SUCCESS] Dispatched to {norm_phone} (Headless)")
+                return True
             else:
-                logger.warning(f"[WHATSAPP ALERT NOT SENT] Could not dispatch to {phone}")
+                logger.warning(f"[WHATSAPP ALERT NOT SENT] Could not dispatch to {norm_phone}")
+                return False
         except Exception as e:
             logger.error(f"[WHATSAPP ALERT EXCEPTION] {e}")
+            return False
 
     def create_alert(
         self,
