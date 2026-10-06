@@ -516,6 +516,25 @@ class StockAlertService:
                 logger.info(f"[STOCK ALERT TRIGGERED] {ticker} for {phone}: {msg_reason}")
                 asyncio.create_task(self._dispatch_whatsapp(phone, alert_text))
 
+                # Real-time WebSocket broadcast to frontend
+                try:
+                    from services.dse_service import DSEMarketService
+                    dse_svc = DSEMarketService.get_instance()
+                    asyncio.create_task(dse_svc._broadcast({
+                        "event": "alert_triggered",
+                        "phone": phone,
+                        "ticker": ticker,
+                        "alert_type": alert_type,
+                        "ltp": ltp,
+                        "change": change,
+                        "percent": percent,
+                        "header": msg_header,
+                        "reason": msg_reason,
+                        "time": time_str
+                    }))
+                except Exception as b_err:
+                    logger.debug(f"[WebSocket broadcast notice] {b_err}")
+
     async def evaluate_news_alert(self, news_item: Dict[str, Any]):
         """Evaluate corporate announcements against user alert subscriptions"""
         code = str(news_item.get("code", "")).strip().upper()
@@ -736,6 +755,20 @@ class StockAlertService:
             "⚡ DataKarkhana Desktop Live Engine"
         )
         await self._dispatch_whatsapp(norm_phone, test_msg)
+        try:
+            from services.dse_service import DSEMarketService
+            dse_svc = DSEMarketService.get_instance()
+            asyncio.create_task(dse_svc._broadcast({
+                "event": "alert_triggered",
+                "phone": norm_phone,
+                "ticker": "BOT_TEST",
+                "alert_type": "TEST_NOTIFICATION",
+                "header": "🤖 WhatsApp Alert Active",
+                "reason": f"Self-Chat test notification dispatched to {norm_phone}",
+                "time": "Just now"
+            }))
+        except Exception:
+            pass
         return True
 
     def handle_bot_command(self, phone: str, text: str) -> Optional[str]:

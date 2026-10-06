@@ -500,6 +500,21 @@ async def send_green_api_test_message(req: TestPingRequest):
             detail=res.get("message", "Failed to dispatch test message via Green-API.")
         )
 
+    try:
+        from services.dse_service import DSEMarketService
+        dse_svc = DSEMarketService.get_instance()
+        asyncio.create_task(dse_svc._broadcast({
+            "event": "alert_triggered",
+            "phone": phone,
+            "ticker": "GREEN_API",
+            "alert_type": "TEST_NOTIFICATION",
+            "header": "🟢 WhatsApp Alert Connected!",
+            "reason": f"Test message delivered to {phone} via Green-API",
+            "time": "Just now"
+        }))
+    except Exception:
+        pass
+
     return {
         "success": True,
         "message": f"Test message dispatched successfully to {phone} via Green-API!",

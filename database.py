@@ -1011,10 +1011,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS phone_verification_otps (
                 phone_number TEXT PRIMARY KEY,
                 otp_code TEXT NOT NULL,
-                expires_at REAL NOT NULL,
+                expires_at DOUBLE PRECISION NOT NULL,
                 attempts INTEGER DEFAULT 0,
                 failed_count INTEGER DEFAULT 0,
-                blocked_until REAL DEFAULT 0,
+                blocked_until DOUBLE PRECISION DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -1033,7 +1033,9 @@ def init_db():
         try:
             cursor.execute("ALTER TABLE verified_phone_numbers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;")
             cursor.execute("ALTER TABLE phone_verification_otps ADD COLUMN IF NOT EXISTS failed_count INTEGER DEFAULT 0;")
-            cursor.execute("ALTER TABLE phone_verification_otps ADD COLUMN IF NOT EXISTS blocked_until REAL DEFAULT 0;")
+            cursor.execute("ALTER TABLE phone_verification_otps ADD COLUMN IF NOT EXISTS blocked_until DOUBLE PRECISION DEFAULT 0;")
+            cursor.execute("ALTER TABLE phone_verification_otps ALTER COLUMN expires_at TYPE DOUBLE PRECISION;")
+            cursor.execute("ALTER TABLE phone_verification_otps ALTER COLUMN blocked_until TYPE DOUBLE PRECISION;")
         except Exception:
             pass
         try:

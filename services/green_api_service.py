@@ -37,8 +37,11 @@ class GreenApiService:
 
     @classmethod
     def format_chat_id(cls, phone: str) -> str:
-        """Format phone into Green-API chatId format (e.g. 8801863443343@c.us)"""
-        norm = cls.normalize_phone(phone)
+        """Format phone into Green-API chatId format (e.g. 8801863443343@c.us or group-id@g.us)"""
+        p = str(phone).strip()
+        if "@g.us" in p or "@c.us" in p:
+            return p
+        norm = cls.normalize_phone(p)
         return f"{norm}@c.us"
 
     @staticmethod
