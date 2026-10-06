@@ -138,16 +138,40 @@ async def get_company_overview(symbol: str):
 
 @router.get("/summary")
 async def get_market_summary():
-    """Get live market summary: DSEX, DS30, DSES, total turnover, volume, trades, and breadth"""
+    """Get live market summary: DSEX, DS30, DSES, total turnover, volume, trades, breadth, and live LankaBD market status"""
     service = DSEMarketService.get_instance()
     summary = service._last_market_summary
     if not summary:
         summary = await service.fetch_market_summary()
+    exchanges = await service.fetch_exchanges_status()
+    dse_status = service.get_market_status("DSE")
     return {
         "summary": summary,
-        "is_trading_hour": service.is_trading_hour(),
+        "is_trading_hour": service.is_trading_hour("DSE"),
+        "market_status": dse_status,
+        "exchanges": exchanges,
         "total_tracked": len(service._last_prices),
         "last_scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S+06:00", time.localtime(service._last_scrape_time)) if service._last_scrape_time else None
+    }
+
+@router.get("/exchanges")
+async def get_exchanges():
+    """Get all exchanges and their live market status directly synchronized with LankaBangla Portal"""
+    service = DSEMarketService.get_instance()
+    return await service.fetch_exchanges_status()
+
+@router.get("/status")
+async def get_market_status(exchange: str = Query("DSE", description="Exchange symbol: DSE or CSE")):
+    """Get real-time market status from LankaBangla for given exchange (Open, Pre-Open, Post-Close, Closed)"""
+    service = DSEMarketService.get_instance()
+    exchanges = await service.fetch_exchanges_status()
+    target = next((e for e in exchanges if e.get("code", "").upper() == exchange.upper()), None)
+    status_str = target.get("marketStatus") if target else service.get_market_status(exchange)
+    return {
+        "exchange": exchange.upper(),
+        "market_status": status_str,
+        "is_trading_hour": service.is_trading_hour(exchange),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+06:00", time.localtime())
     }
 
 @router.get("/depth")

@@ -131,6 +131,11 @@ class DSEMarketService:
         self._ticker_name_map: Dict[str, str] = {}
         self._company_overview_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
+        # LankaBangla real-time market status & exchanges cache
+        self._exchanges_cache: List[Dict[str, Any]] = []
+        self._last_exchanges_time: float = 0.0
+        self._market_status_map: Dict[str, str] = {"DSE": "Closed", "CSE": "Closed"}
+
     @classmethod
     def get_instance(cls) -> "DSEMarketService":
         if cls._instance is None:
@@ -180,18 +185,33 @@ class DSEMarketService:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             }
 
-    def is_trading_hour(self) -> bool:
-        """Trading hours: Sunday (6) to Thursday (3), 10:00 AM to 2:30 PM BST (UTC+6)."""
+    def _is_clock_trading_hour(self) -> bool:
+        """Fallback trading hours: Sunday (6) to Thursday (3), 09:55 AM to 2:35 PM BST (UTC+6)."""
         now_bst = datetime.now(BST)
         weekday = now_bst.weekday()
-        # In Python: Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6
         if weekday in (4, 5):  # Friday, Saturday
             return False
-        
         current_time = now_bst.time()
         start_time = datetime.strptime("09:55:00", "%H:%M:%S").time()
         end_time = datetime.strptime("14:35:00", "%H:%M:%S").time()
         return start_time <= current_time <= end_time
+
+    def is_trading_hour(self, exchange: str = "DSE") -> bool:
+        """
+        Trading hour state directly synchronized from LankaBangla portal live marketStatus.
+        Returns True if status is 'Open' or 'Pre-Open'. Falls back to clock schedule if uninitialized.
+        """
+        st = self._market_status_map.get(exchange.upper(), "").strip().lower()
+        if st:
+            return st in ("open", "pre-open")
+        return self._is_clock_trading_hour()
+
+    def get_market_status(self, exchange: str = "DSE") -> str:
+        """Get live market status string (e.g. 'Open', 'Pre-Open', 'Post-Close', 'Closed') directly from LankaBangla"""
+        st = self._market_status_map.get(exchange.upper())
+        if st:
+            return st
+        return "Open" if self._is_clock_trading_hour() else "Closed"
 
     async def fetch_sector_heatmap(self) -> Dict[str, Any]:
         """Fetch all 19 sectors, stock mappings, and generate sector heatmap layout from LankaBangla"""
@@ -331,6 +351,7 @@ class DSEMarketService:
             date_part = trade_time.split(" ")[0] if " " in trade_time else datetime.now(BST).strftime("%Y-%m-%d")
             time_part = trade_time.split(" ")[1] if " " in trade_time else ""
 
+            dse_status = self.get_market_status("DSE")
             summary_data = {
                 "indices": indices,
                 "totals": {
@@ -341,8 +362,10 @@ class DSEMarketService:
                     "tradeTime": trade_time
                 },
                 "breadth": breadth,
+                "market_status": dse_status,
+                "exchanges": self.fetch_exchanges(),
                 "session": {
-                    "state": "OPEN" if self.is_trading_hour() else "CLOSED",
+                    "state": dse_status.upper(),
                     "date": date_part,
                     "time": time_part
                 }
@@ -358,6 +381,8 @@ class DSEMarketService:
                     "event": "market_update",
                     "timestamp": datetime.now(BST).isoformat(),
                     "is_trading_hour": self.is_trading_hour(),
+                    "market_status": dse_status,
+                    "exchanges": self.fetch_exchanges(),
                     "total_tracked": len(self._last_prices),
                     "market_summary": summary_data
                 }))
@@ -892,15 +917,69 @@ class DSEMarketService:
             logger.error(f"[LankaBD Top Movers Error] {e}")
             return self._top_movers_cache or {}
 
+    async def fetch_exchanges_status(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        Fetch real-time market status directly from LankaBangla (/api/APIMarket/GetExchanges).
+        Returns live status for both DSE and CSE (Open, Pre-Open, Post-Close, Closed).
+        """
+        now = time.time()
+        if not force_refresh and self._exchanges_cache and (now - self._last_exchanges_time) < 8.0:
+            return self._exchanges_cache
+
+        try:
+            client = await self.get_client()
+            headers = await self.get_lankabd_headers()
+            res = await client.get(f"{LANKABD_BASE_URL}/api/APIMarket/GetExchanges", headers=headers)
+            if res.status_code in (400, 401):
+                headers = await self.get_lankabd_headers(force_refresh=True)
+                res = await client.get(f"{LANKABD_BASE_URL}/api/APIMarket/GetExchanges", headers=headers)
+
+            if res.status_code == 200:
+                raw_list = res.json()
+                parsed = []
+                for item in raw_list:
+                    code = item.get("code", "DSE").upper()
+                    mkt_status = item.get("marketStatus") or ("Open" if self._is_clock_trading_hour() else "Closed")
+                    self._market_status_map[code] = mkt_status
+                    parsed.append({
+                        "code": code,
+                        "name": item.get("name", f"{code} Stock Exchange"),
+                        "exchangeID": item.get("exchangeID", 1 if code == "DSE" else 2),
+                        "marketStatus": mkt_status,
+                        "status": mkt_status,
+                        "selected": item.get("selected", 1),
+                        "logoPath": item.get("logoPath", f"/images/{code.lower()}_logo.png"),
+                        "logoSizeCSS": item.get("logoSizeCSS", ""),
+                        "currency": "BDT",
+                        "city": "Dhaka" if code == "DSE" else "Chittagong",
+                        "country": "Bangladesh",
+                        "indices": ["DSEX", "DS30", "DSES"] if code == "DSE" else ["CASPI", "CSCX", "CSE30"],
+                        "trading_hours": "10:00 AM - 02:30 PM (BST)"
+                    })
+                self._exchanges_cache = parsed
+                self._last_exchanges_time = now
+                return parsed
+        except Exception as e:
+            logger.error(f"[LankaBD Exchanges Error] {e}")
+
+        return self.fetch_exchanges()
+
     def fetch_exchanges(self) -> List[Dict[str, Any]]:
-        """Return list of supported stock exchanges (DSE and CSE)"""
-        is_open = self.is_trading_hour()
+        """Return list of supported stock exchanges with current cached LankaBangla status"""
+        if self._exchanges_cache:
+            return self._exchanges_cache
+        clock_open = self._is_clock_trading_hour()
+        dse_st = self._market_status_map.get("DSE", "Open" if clock_open else "Closed")
+        cse_st = self._market_status_map.get("CSE", "Open" if clock_open else "Closed")
         return [
             {
                 "code": "DSE",
                 "name": "Dhaka Stock Exchange PLC.",
                 "exchangeID": 1,
-                "status": "OPEN" if is_open else "CLOSED",
+                "marketStatus": dse_st,
+                "status": dse_st,
+                "selected": 1,
+                "logoPath": "/images/dse_logo.png",
                 "currency": "BDT",
                 "city": "Dhaka",
                 "country": "Bangladesh",
@@ -911,7 +990,10 @@ class DSEMarketService:
                 "code": "CSE",
                 "name": "Chittagong Stock Exchange PLC.",
                 "exchangeID": 2,
-                "status": "OPEN" if is_open else "CLOSED",
+                "marketStatus": cse_st,
+                "status": cse_st,
+                "selected": 1,
+                "logoPath": "/images/cse_logo.png",
                 "currency": "BDT",
                 "city": "Chittagong",
                 "country": "Bangladesh",
@@ -919,6 +1001,7 @@ class DSEMarketService:
                 "trading_hours": "10:00 AM - 02:30 PM (BST)"
             }
         ]
+
 
     def get_ticker_detail(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Return full details, calculated technicals and intraday history for a single ticker"""
@@ -1445,6 +1528,7 @@ class DSEMarketService:
             "event": "init",
             "market_summary": self._last_market_summary,
             "is_trading_hour": self.is_trading_hour(),
+            "market_status": self.get_market_status("DSE"),
             "sector_heatmap": self._sector_heatmap_cache,
             "tickers_count": len(self._last_prices),
             "tickers": list(self._last_prices.values()),
@@ -1465,6 +1549,7 @@ class DSEMarketService:
             "event": "init",
             "market_summary": self._last_market_summary,
             "is_trading_hour": self.is_trading_hour(),
+            "market_status": self.get_market_status("DSE"),
             "sector_heatmap": self._sector_heatmap_cache,
             "tickers_count": len(self._last_prices),
             "tickers": list(self._last_prices.values()),
@@ -1488,6 +1573,7 @@ class DSEMarketService:
 
         # Initial bootstrap
         try:
+            await self.fetch_exchanges_status()
             await self.fetch_sector_heatmap()
             await self.fetch_market_summary()
             await self.fetch_live_prices()
@@ -1505,10 +1591,11 @@ class DSEMarketService:
                 started = time.monotonic()
                 live = self.is_trading_hour()
 
-                # 1. Fetch live prices & market summary every cycle
+                # 1. Fetch live prices, market summary & exchange status every cycle
                 await asyncio.gather(
                     self.fetch_live_prices(),
                     self.fetch_market_summary(),
+                    self.fetch_exchanges_status(),
                     return_exceptions=True
                 )
 
@@ -1529,6 +1616,7 @@ class DSEMarketService:
                             for tw in target_ws:
                                 try:
                                     await asyncio.wait_for(tw.send_text(d_msg), timeout=2.0)
+                                    pass
                                 except Exception:
                                     pass
                         except Exception as ex:
@@ -1565,18 +1653,21 @@ class DSEMarketService:
                         })
                     asyncio.create_task(_refresh_all_intel())
 
-                # 5. Broadcast heartbeat with precise server milliseconds
+                # 5. Broadcast heartbeat with precise server milliseconds and live LankaBD market status
                 await self._broadcast({
                     "event": "heartbeat",
                     "timestamp": datetime.now(BST).isoformat(),
                     "server_time_ms": int(time.time() * 1000),
                     "last_scraped_at": datetime.fromtimestamp(self._last_scrape_time, tz=BST).isoformat() if self._last_scrape_time else None,
                     "is_trading_hour": live,
+                    "market_status": self.get_market_status("DSE"),
+                    "exchanges": self.fetch_exchanges(),
                     "cycle": cycle,
                     "active_clients": len(self._ws_clients),
                     "total_tracked": len(self._last_prices),
                     "source": "lankabd"
                 })
+
 
                 interval = LIVE_CYCLE_SEC if live else CLOSED_CYCLE_SEC
                 elapsed = time.monotonic() - started
