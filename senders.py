@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import threading
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -119,7 +120,7 @@ def fix_chrome_preferences(profile_path):
         except Exception:
             pass
 
-def setup_driver(log_cb=None):
+def setup_driver(log_cb=None, headless: bool = False):
     """Setup Chrome options (or Edge fallback) and persistence profile directory for WhatsApp"""
     def _log(msg: str):
         if log_cb and callable(log_cb):
@@ -144,6 +145,10 @@ def setup_driver(log_cb=None):
     # 1. Attempt Google Chrome initialization
     try:
         options = ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
@@ -172,7 +177,7 @@ def setup_driver(log_cb=None):
 
         driver = webdriver.Chrome(service=chrome_service, options=options) if chrome_service else webdriver.Chrome(options=options)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        _log("🌐 Google Chrome session established for WhatsApp.")
+        _log(f"🌐 Google Chrome session established for WhatsApp (headless={headless}).")
         return driver
     except Exception as ex:
         chrome_err = ex
@@ -181,6 +186,10 @@ def setup_driver(log_cb=None):
     # 2. Attempt Microsoft Edge fallback
     try:
         edge_options = EdgeOptions()
+        if headless:
+            edge_options.add_argument("--headless=new")
+            edge_options.add_argument("--disable-gpu")
+            edge_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         edge_options.add_argument("--no-sandbox")
         edge_options.add_argument("--disable-dev-shm-usage")
         edge_options.add_argument("--disable-blink-features=AutomationControlled")
@@ -198,7 +207,7 @@ def setup_driver(log_cb=None):
 
         driver = webdriver.Edge(service=edge_service, options=edge_options) if edge_service else webdriver.Edge(options=edge_options)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        _log("✅ Microsoft Edge session established successfully as fallback for WhatsApp.")
+        _log(f"✅ Microsoft Edge session established successfully as fallback for WhatsApp (headless={headless}).")
         return driver
     except Exception as ex:
         edge_err = ex
@@ -715,27 +724,61 @@ def run_whatsapp_campaign(campaign_id, contacts, template_text, recipient_group,
                 pass
 
 
-def send_single_whatsapp_message(phone: str, message_text: str) -> bool:
-    """Send an immediate single WhatsApp message via local Selenium session for stock alerts."""
+_headless_stock_driver = None
+_headless_stock_lock = threading.Lock()
+
+def get_or_create_headless_stock_driver():
+    """Retrieve or spawn a persistent headless Chrome instance dedicated to stock alerts and self-chat bot"""
+    global _headless_stock_driver
+    if _headless_stock_driver is not None:
+        try:
+            _ = _headless_stock_driver.title
+            return _headless_stock_driver
+        except Exception:
+            try:
+                _headless_stock_driver.quit()
+            except Exception:
+                pass
+            _headless_stock_driver = None
+
+    try:
+        drv = setup_driver(log_cb=print, headless=True)
+        if wait_for_whatsapp_login(drv, timeout=30):
+            _headless_stock_driver = drv
+            return _headless_stock_driver
+        else:
+            print("[STOCK ALERT SENDER] WhatsApp session not logged in. Scan QR code in settings to link.")
+            try:
+                drv.quit()
+            except Exception:
+                pass
+            return None
+    except Exception as e:
+        print(f"[STOCK ALERT SENDER] Error creating headless WhatsApp session: {e}")
+        return None
+
+def send_single_whatsapp_message(phone: str, message_text: str, headless: bool = True) -> bool:
+    """Send an immediate single WhatsApp message via headless local Selenium session for stock alerts."""
     formatted = format_phone(phone)
     if not formatted:
         print(f"[STOCK ALERT SENDER] Invalid phone number: {phone}")
         return False
 
-    driver = get_active_setup_driver()
-    driver_owned = False
-    if not driver:
-        try:
-            driver = setup_driver(log_cb=print)
-            driver_owned = True
-            if not wait_for_whatsapp_login(driver, timeout=30):
-                print("[STOCK ALERT SENDER] WhatsApp Web not logged in. Please scan QR in desktop app.")
-                if driver_owned:
-                    driver.quit()
+    with _headless_stock_lock:
+        driver = get_or_create_headless_stock_driver() if headless else get_active_setup_driver()
+        driver_owned = False
+        if not driver:
+            try:
+                driver = setup_driver(log_cb=print, headless=headless)
+                driver_owned = True
+                if not wait_for_whatsapp_login(driver, timeout=30):
+                    print("[STOCK ALERT SENDER] WhatsApp Web not logged in. Please scan QR in desktop app.")
+                    if driver_owned:
+                        driver.quit()
+                    return False
+            except Exception as e:
+                print(f"[STOCK ALERT SENDER] Error starting driver: {e}")
                 return False
-        except Exception as e:
-            print(f"[STOCK ALERT SENDER] Error starting driver: {e}")
-            return False
 
     try:
         url = f"https://web.whatsapp.com/send?phone={formatted}"

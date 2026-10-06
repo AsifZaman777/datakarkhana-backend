@@ -21,136 +21,13 @@ class CreateAlertRequest(BaseModel):
 class TestPingRequest(BaseModel):
     whatsapp_number: str
 
-@router.get("/summary")
-async def get_market_summary():
-    """Get real-time market indices (DSEX, DS30, DSES), turnover, and market breadth"""
-    service = DSEMarketService.get_instance()
-    return service.get_market_summary()
+class SendOtpRequest(BaseModel):
+    whatsapp_number: str
 
-@router.get("/boards")
-async def get_all_boards():
-    """Get all trading boards in DSE (Public, SME, ATB, Corporate Debt, Govt Treasury Bonds) with instrument counts"""
-    service = DSEMarketService.get_instance()
-    return service.get_boards_summary()
+class VerifyOtpRequest(BaseModel):
+    whatsapp_number: str
+    otp: str
 
-@router.get("/all")
-async def get_all_stocks(
-    search: Optional[str] = Query(None, description="Search ticker symbol e.g. SQURPHARMA, ACHIASF, LBS"),
-    sector: Optional[str] = Query(None, description="Filter by sector e.g. Pharmaceuticals, Bank, Food & Allied"),
-    category: Optional[str] = Query(None, description="Filter by category e.g. A, B, Z, SME, ATB, G-SEC"),
-    board: Optional[str] = Query(None, description="Filter by board: PUBLIC, SME, ATB, DEBT, YIELDDBT (or ALL)"),
-    sort_by: str = Query("turnover", description="Sort by 'turnover', 'percent', 'ltp', 'volume', 'code'"),
-    sort_order: str = Query("desc", description="'asc' or 'desc'")
-):
-    """Get all tracked stock prices with real-time quotes and board filters"""
-    service = DSEMarketService.get_instance()
-    stocks = service.get_all_stocks(
-        search=search,
-        sector=sector,
-        category=category,
-        board=board,
-        sort_by=sort_by,
-        sort_order=sort_order
-    )
-    return {
-        "count": len(stocks),
-        "stocks": stocks
-    }
-
-@router.get("/sectors")
-@router.get("/sector-heatmap")
-async def get_sector_heatmap():
-    """Get DSE official Sector Heatmap scraped directly from www.dse.com.bd"""
-    service = DSEMarketService.get_instance()
-    if not service._sector_heatmap_cache or (time.time() - service._sector_heatmap_cache_ts) >= 60:
-        await service.fetch_sector_heatmap()
-    return service.get_sector_heatmap()
-
-@router.get("/depth")
-async def get_market_depth(
-    code: Optional[str] = Query(None, description="Stock instrument code e.g. IPDC, GP"),
-    ticker: Optional[str] = Query(None, description="Alternative ticker param")
-):
-    """Get 10-level live order book (bids/asks, queues, priceStats)"""
-    target = code or ticker or "IPDC"
-    service = DSEMarketService.get_instance()
-    return await service.get_market_depth(target)
-
-@router.get("/depth/instruments")
-async def get_depth_instruments():
-    """Get list of instruments available for market depth"""
-    service = DSEMarketService.get_instance()
-    return await service.get_depth_instruments()
-
-@router.get("/top-shares")
-async def get_top_shares():
-    """Get Top 20 by Turnover, Gainers, Losers, and Volume"""
-    service = DSEMarketService.get_instance()
-    return service.get_top_shares()
-
-@router.get("/circuit-breakers")
-async def get_circuit_breakers():
-    """Get daily circuit breaker price limits (ceiling, floor, tick size)"""
-    service = DSEMarketService.get_instance()
-    rows = await service.get_circuit_breakers()
-    return {
-        "count": len(rows),
-        "circuit_breakers": rows
-    }
-
-@router.get("/recent-market-info")
-async def get_recent_market_info(
-    from_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    to_date: Optional[str] = Query(None, description="YYYY-MM-DD")
-):
-    """Get daily historical market statistics (turnover, DSEX, marketCap, volume)"""
-    service = DSEMarketService.get_instance()
-    return await service.get_recent_market_info(from_date, to_date)
-
-@router.get("/pe")
-async def get_pe_at_a_glance():
-    """Get Price to Earnings (P/E) ratios for all traded companies"""
-    service = DSEMarketService.get_instance()
-    rows = await service.get_pe_at_a_glance()
-    return {
-        "count": len(rows),
-        "pe_data": rows
-    }
-
-@router.get("/at-a-glance")
-async def get_at_a_glance():
-    """Get Market at a Glance multi-year comparison stats"""
-    service = DSEMarketService.get_instance()
-    rows = await service.get_at_a_glance()
-    return {
-        "count": len(rows),
-        "at_a_glance": rows
-    }
-
-@router.get("/detail/{ticker}")
-async def get_stock_detail(ticker: str):
-    """Get live details and intraday tick points for TradingView chart canvas"""
-    service = DSEMarketService.get_instance()
-    detail = service.get_stock_detail(ticker)
-    if not detail:
-        raise HTTPException(status_code=404, detail=f"Stock ticker '{ticker}' not found.")
-    return detail
-
-@router.get("/news")
-async def get_stock_news(
-    ticker: Optional[str] = Query(None, description="Filter news by ticker symbol"),
-    limit: int = Query(50, ge=1, le=100)
-):
-    """Get latest corporate announcements from DSE"""
-    service = DSEMarketService.get_instance()
-    news = service.get_recent_news(limit=limit)
-    if ticker:
-        t_clean = ticker.upper().strip()
-        news = [n for n in news if str(n.get("code", "")).upper() == t_clean]
-    return {
-        "count": len(news),
-        "news": news
-    }
 
 @router.websocket("/ws")
 async def websocket_live_prices(websocket: WebSocket):
@@ -193,23 +70,201 @@ async def stream_live_prices(request: Request):
         }
     )
 
+@router.get("/tickers")
+async def get_tickers(
+    exchange: Optional[str] = Query(None, description="Exchange code: DSE or CSE"),
+    board: Optional[str] = Query(None, description="Board: ALL, MAIN, SME, DEBT, ATB"),
+    category: Optional[str] = Query(None, description="Category: A, B, N, Z"),
+    sector: Optional[str] = Query(None, description="Sector name"),
+    search: Optional[str] = Query(None, description="Search symbol or name"),
+    sort_by: Optional[str] = Query(None, description="Sort field, e.g. turnover, percent, volume, ltp"),
+    limit: Optional[int] = Query(None, description="Max results to return"),
+    page: Optional[int] = Query(None, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(25, ge=1, le=100, description="Page size, defaults to 25")
+):
+    """Get all cached stock tickers with flexible multi-board & multi-category screening and 25-stock pagination"""
+    service = DSEMarketService.get_instance()
+    tickers = service.get_tickers(
+        exchange=exchange,
+        board=board,
+        category=category,
+        sector=sector,
+        search=search,
+        sort_by=sort_by,
+        limit=limit
+    )
+
+    if page is not None:
+        total_filtered = len(tickers)
+        total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+        start = (page - 1) * page_size
+        sliced = tickers[start:start + page_size]
+        return {
+            "count": len(sliced),
+            "total_available": len(service._last_prices),
+            "total_filtered": total_filtered,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "tickers": sliced
+        }
+
+    return {
+        "count": len(tickers),
+        "total_available": len(service._last_prices),
+        "tickers": tickers
+    }
+
+@router.get("/ticker/{ticker}")
+async def get_ticker_detail(ticker: str):
+    """Get comprehensive pro trading details, intraday ticks, and metrics for a specific stock"""
+    service = DSEMarketService.get_instance()
+    detail = service.get_ticker_detail(ticker)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Stock ticker '{ticker}' not found")
+    return detail
+
+@router.get("/overview/{symbol}")
+@router.get("/company/{symbol}/overview")
+async def get_company_overview(symbol: str):
+    """
+    Get comprehensive company overview from LankaBangla matching OverviewV2 specifications.
+    Includes profile, statistics, shareholding patterns, financial ratios, dividend history,
+    interim reports, board members, auditors, and contacts.
+    """
+    service = DSEMarketService.get_instance()
+    overview = await service.fetch_company_overview(symbol)
+    return overview
+
+@router.get("/summary")
+async def get_market_summary():
+    """Get live market summary: DSEX, DS30, DSES, total turnover, volume, trades, and breadth"""
+    service = DSEMarketService.get_instance()
+    summary = service._last_market_summary
+    if not summary:
+        summary = await service.fetch_market_summary()
+    return {
+        "summary": summary,
+        "is_trading_hour": service.is_trading_hour(),
+        "total_tracked": len(service._last_prices),
+        "last_scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S+06:00", time.localtime(service._last_scrape_time)) if service._last_scrape_time else None
+    }
+
+@router.get("/depth")
+async def get_market_depth(
+    symbol: str = Query("GP", description="Stock symbol, e.g. GP, SQURPHARMA, BEXIMCO"),
+    exchange: str = Query("DSE", description="Exchange: DSE or CSE")
+):
+    """
+    Get real-time order book / market depth from LankaBangla for DSE or CSE.
+    Returns bids (buy orders), asks (sell orders), buy/sell percentages, and stats.
+    """
+    service = DSEMarketService.get_instance()
+    return await service.fetch_market_depth(symbol=symbol, exchange=exchange)
+
+@router.get("/sectors")
+async def get_sector_heatmap():
+    """Get all 19 market sectors, turnover contributions, and price changes"""
+    service = DSEMarketService.get_instance()
+    heatmap = service._sector_heatmap_cache
+    if not heatmap:
+        heatmap = await service.fetch_sector_heatmap()
+    return heatmap
+
+@router.get("/news")
+async def get_market_news(
+    ticker: Optional[str] = Query(None, description="Filter news by stock ticker"),
+    limit: int = Query(25, description="Number of news items to return")
+):
+    """Get latest corporate announcements, dividend declarations, AGM notices, and market news"""
+    service = DSEMarketService.get_instance()
+    news = service._recent_news
+    if ticker:
+        q = ticker.upper().strip()
+        news = [n for n in news if n.get("code") == q or q in n.get("summary", "").upper()]
+    return {
+        "count": len(news[:limit]),
+        "news": news[:limit]
+    }
+
+@router.get("/block-market")
+async def get_block_market():
+    """Get latest large block market transactions from LankaBangla"""
+    service = DSEMarketService.get_instance()
+    deals = await service.fetch_block_market()
+    return {
+        "count": len(deals),
+        "deals": deals
+    }
+
+@router.get("/movers")
+async def get_index_movers(count: int = Query(15, description="Number of movers to return")):
+    """Get market index movers, contribution points, and top stock leaders"""
+    service = DSEMarketService.get_instance()
+    movers = await service.fetch_index_movers(count=count)
+    top_movers = await service.fetch_top_movers()
+    return {
+        "index_movers": movers,
+        "top_lists": top_movers
+    }
+
+@router.get("/exchanges")
+async def get_exchanges():
+    """Get list of supported stock exchanges: Dhaka Stock Exchange (DSE) and Chittagong Stock Exchange (CSE)"""
+    service = DSEMarketService.get_instance()
+    return {
+        "exchanges": service.fetch_exchanges()
+    }
+
+
+@router.post("/alerts/send-otp")
+async def send_verification_otp(req: SendOtpRequest):
+    """Dispatch a 6-digit verification code to WhatsApp for phone verification"""
+    alert_service = StockAlertService.get_instance()
+    res = await alert_service.send_verification_otp(req.whatsapp_number)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+@router.post("/alerts/verify-otp")
+async def verify_phone_otp(req: VerifyOtpRequest):
+    """Verify the 6-digit OTP code and unlock self-chat stock alert service"""
+    alert_service = StockAlertService.get_instance()
+    res = await alert_service.verify_phone_otp(req.whatsapp_number, req.otp)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+@router.get("/alerts/verification-status")
+async def check_verification_status(whatsapp_number: str = Query(...)):
+    """Check if a phone number is verified for stock alerts"""
+    alert_service = StockAlertService.get_instance()
+    is_verified = alert_service.is_phone_verified(whatsapp_number)
+    return {
+        "whatsapp_number": whatsapp_number,
+        "is_verified": is_verified
+    }
+
 @router.post("/alerts")
 async def create_stock_alert(req: CreateAlertRequest):
     """Create a user WhatsApp alert subscription"""
     alert_service = StockAlertService.get_instance()
-    alert = alert_service.create_alert(
-        whatsapp_number=req.whatsapp_number,
-        ticker=req.ticker,
-        alert_type=req.alert_type,
-        threshold_value=req.threshold_value or 0.0,
-        is_one_shot=req.is_one_shot if req.is_one_shot is not None else True,
-        user_id=req.user_id
-    )
-    return {
-        "success": True,
-        "message": f"Alert created for {req.ticker} ({req.alert_type})",
-        "alert": alert
-    }
+    try:
+        alert = alert_service.create_alert(
+            whatsapp_number=req.whatsapp_number,
+            ticker=req.ticker,
+            alert_type=req.alert_type,
+            threshold_value=req.threshold_value or 0.0,
+            is_one_shot=req.is_one_shot if req.is_one_shot is not None else True,
+            user_id=req.user_id
+        )
+        return {
+            "success": True,
+            "message": f"Alert created for {req.ticker} ({req.alert_type})",
+            "alert": alert
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 @router.get("/alerts")
 async def get_stock_alerts(
@@ -244,10 +299,15 @@ async def rearm_stock_alert(alert_id: str):
 
 @router.post("/alerts/test-ping")
 async def send_test_ping(req: TestPingRequest, background_tasks: BackgroundTasks):
-    """Dispatch an immediate WhatsApp test alert to verify local desktop connectivity"""
+    """Dispatch an immediate WhatsApp test alert in self-chat to verify local desktop connectivity"""
     alert_service = StockAlertService.get_instance()
+    if not alert_service.is_phone_verified(req.whatsapp_number):
+        raise HTTPException(
+            status_code=400,
+            detail="Phone number not verified. Please click 'Send Verification OTP' to verify your WhatsApp Self-Chat first."
+        )
     background_tasks.add_task(alert_service.send_test_alert, req.whatsapp_number)
     return {
         "success": True,
-        "message": f"Test alert queued for {req.whatsapp_number}. Check your WhatsApp in a few seconds."
+        "message": f"Test alert dispatched to {req.whatsapp_number} via WhatsApp Self-Chat."
     }

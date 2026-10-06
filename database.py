@@ -998,6 +998,22 @@ def init_db():
                 value TEXT
             );
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS verified_phone_numbers (
+                phone_number TEXT PRIMARY KEY,
+                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS phone_verification_otps (
+                phone_number TEXT PRIMARY KEY,
+                otp_code TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         try:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_ticks_ticker ON stock_ticks_intraday(ticker, recorded_at);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_stock_alerts_ticker ON user_stock_alerts(ticker, status);")
