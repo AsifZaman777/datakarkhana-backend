@@ -63,8 +63,23 @@ class TestGenericEcommerceEngine(unittest.TestCase):
         self.assertEqual(plat, "ebay")
         self.assertIsNotNone(spec)
 
-        plat_pickaboo, _ = detect_platform_from_url("https://www.pickaboo.com/search/result/?q=earphone")
+        plat_pickaboo, _ = detect_platform_from_url("https://www.pickaboo.com/search-result/smartwatch")
         self.assertEqual(plat_pickaboo, "pickaboo")
+
+        plat_amazon, _ = detect_platform_from_url("https://www.amazon.com/s?k=earbuds")
+        self.assertEqual(plat_amazon, "amazon")
+
+        plat_startech, _ = detect_platform_from_url("https://www.startech.com.bd/product/search?search=ssd")
+        self.assertEqual(plat_startech, "startech")
+
+        plat_ryans, _ = detect_platform_from_url("https://www.ryans.com/search?search=laptop")
+        self.assertEqual(plat_ryans, "ryans")
+
+        plat_rokomari, _ = detect_platform_from_url("https://www.rokomari.com/search?term=earphone&search_type=ALL")
+        self.assertEqual(plat_rokomari, "rokomari")
+
+        plat_chaldal, _ = detect_platform_from_url("https://chaldal.com/search/milk")
+        self.assertEqual(plat_chaldal, "chaldal")
 
         plat_custom, _ = detect_platform_from_url("https://mystore.myshopify.com/collections/all")
         self.assertEqual(plat_custom, "generic")

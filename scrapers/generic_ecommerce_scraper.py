@@ -31,7 +31,7 @@ SUPPORTED_PLATFORMS = {
     "pickaboo": {
         "name": "Pickaboo",
         "domain": "pickaboo.com",
-        "search_pattern": "https://www.pickaboo.com/search/result/?q={query}&p={page}",
+        "search_pattern": "https://www.pickaboo.com/search-result/{query}?page={page}",
         "card_selector": ".product-item, .product-item-info, div.item",
         "title_selector": ".product-item-name a, a.product-item-link, .product-title",
         "price_selector": ".price-box .special-price .price, .price-box .price, .product-price",
@@ -73,7 +73,7 @@ SUPPORTED_PLATFORMS = {
     "ryans": {
         "name": "Ryans Computers",
         "domain": "ryans.com",
-        "search_pattern": "https://www.ryans.com/search?q={query}&page={page}",
+        "search_pattern": "https://www.ryans.com/search?search={query}&page={page}",
         "card_selector": ".product-box, .cus-col-2, .card",
         "title_selector": ".card-title a, p.card-text a, .product-title",
         "price_selector": ".pr-text, .price",
@@ -87,7 +87,7 @@ SUPPORTED_PLATFORMS = {
     "rokomari": {
         "name": "Rokomari",
         "domain": "rokomari.com",
-        "search_pattern": "https://www.rokomari.com/search?term={query}&page={page}",
+        "search_pattern": "https://www.rokomari.com/search?term={query}&search_type=ALL&page={page}",
         "card_selector": ".book-list-wrapper, .product-box",
         "title_selector": ".book-title, .product-title",
         "price_selector": ".current-price, .price",
@@ -685,9 +685,7 @@ class GenericEcommerceScraper(BaseSearchPaginationScraper):
 
             if not matched_key:
                 # Check platform spec
-                if self.platform_key == "pickaboo":
-                    matched_key = "p"
-                elif self.platform_key == "ebay":
+                if self.platform_key == "ebay":
                     matched_key = "_pgn"
                 else:
                     matched_key = "page"
